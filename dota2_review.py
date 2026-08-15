@@ -29,7 +29,7 @@ except ImportError:  # OpenWrt's minimal Python build may omit this desktop-only
 
 API_BASE = "https://api.opendota.com/api"
 TELEGRAM_API_BASE = "https://api.telegram.org"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 USER_AGENT = f"dota2-match-review/{APP_VERSION}"
 CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 STEAM_ID64_BASE = 76561197960265728
@@ -37,6 +37,8 @@ MAX_ACCOUNT_ID = 2**32 - 1
 PARSE_POLL_INTERVAL_SECONDS = 10 * 60
 PARSE_WAIT_TIMEOUT_SECONDS = 60 * 60
 DEFAULT_RETENTION_DAYS = 30
+HERO_HISTORY_COUNTS = (3, 5, 10)
+HERO_BENCHMARK_COUNTS = (3, 5)
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 SERVERCHAN_API_BASE = "https://sctapi.ftqq.com"
@@ -1134,6 +1136,61 @@ def fetch_recent_matches(account_id: int) -> list[dict[str, Any]]:
     if not isinstance(response, list):
         raise OpenDotaError("OpenDota 返回的最近比赛列表格式异常。")
     return [row for row in response if isinstance(row, dict)]
+
+
+def fetch_player_hero_matches(
+    account_id: int, hero_id: int, limit: int
+) -> list[dict[str, Any]]:
+    """Return the player's newest matches for one hero."""
+    query = urlencode({"hero_id": int(hero_id), "limit": int(limit)})
+    response = request_json(f"/players/{account_id}/matches?{query}")
+    if not isinstance(response, list):
+        raise OpenDotaError("OpenDota 返回的英雄比赛历史格式异常。")
+    return [row for row in response if isinstance(row, dict)][:limit]
+
+
+def fetch_pro_hero_matches(hero_id: int, limit: int) -> list[dict[str, Any]]:
+    """Return recent professional matches in which the hero was played."""
+    response = request_json(f"/heroes/{int(hero_id)}/matches")
+    if not isinstance(response, list):
+        raise OpenDotaError("OpenDota 返回的职业比赛列表格式异常。")
+    return [row for row in response if isinstance(row, dict)][:limit]
+
+
+def public_match_contains_hero(match: dict[str, Any], hero_id: int) -> bool:
+    for key in ("radiant_team", "dire_team"):
+        team = match.get(key)
+        if isinstance(team, list):
+            try:
+                if int(hero_id) in {int(value) for value in team}:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def fetch_high_rank_hero_matches(
+    hero_id: int, limit: int, *, min_rank: int = 80
+) -> list[dict[str, Any]]:
+    """Find recent high-rank public matches containing the selected hero."""
+    selected: list[dict[str, Any]] = []
+    less_than_match_id: int | None = None
+    for _ in range(5):
+        params: dict[str, int] = {"min_rank": int(min_rank)}
+        if less_than_match_id is not None:
+            params["less_than_match_id"] = less_than_match_id
+        response = request_json(f"/publicMatches?{urlencode(params)}")
+        if not isinstance(response, list):
+            raise OpenDotaError("OpenDota 返回的高分路人比赛列表格式异常。")
+        rows = [row for row in response if isinstance(row, dict)]
+        selected.extend(row for row in rows if public_match_contains_hero(row, hero_id))
+        if len(selected) >= limit or not rows:
+            break
+        ids = [int(row["match_id"]) for row in rows if str(row.get("match_id", "")).isdigit()]
+        if not ids:
+            break
+        less_than_match_id = min(ids)
+    return selected[:limit]
 
 
 def fetch_matches_for_local_date(
@@ -2450,6 +2507,286 @@ def open_chatgpt_handoff(bundle_path: Path, project_url: str | None) -> None:
         webbrowser.open(project_url, new=2)
 
 
+def find_hero_player(
+    match: dict[str, Any],
+    hero_id: int,
+    *,
+    account_id: int | None = None,
+    player_slot: int | None = None,
+) -> dict[str, Any] | None:
+    players = match.get("players")
+    if not isinstance(players, list):
+        return None
+    candidates = [player for player in players if isinstance(player, dict)]
+    if account_id is not None:
+        for player in candidates:
+            try:
+                if int(player.get("account_id")) == int(account_id):
+                    return player
+            except (TypeError, ValueError):
+                continue
+    if player_slot is not None:
+        for player in candidates:
+            try:
+                if int(player.get("player_slot")) == int(player_slot):
+                    return player
+            except (TypeError, ValueError):
+                continue
+    for player in candidates:
+        try:
+            if int(player.get("hero_id")) == int(hero_id):
+                return player
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def fetch_hero_sample_details(
+    summaries: list[dict[str, Any]],
+    hero_id: int,
+    *,
+    account_id: int | None = None,
+) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    for index, summary in enumerate(summaries, start=1):
+        try:
+            match_id = validate_match_id(str(summary.get("match_id") or ""))
+        except ValueError:
+            continue
+        print(f"  正在读取样本 {index}/{len(summaries)}：{match_id}")
+        details = request_json(f"/matches/{match_id}", retries=1)
+        if not isinstance(details, dict):
+            continue
+        slot: int | None = None
+        try:
+            slot = int(summary.get("player_slot"))
+        except (TypeError, ValueError):
+            pass
+        player = find_hero_player(
+            details,
+            hero_id,
+            account_id=account_id,
+            player_slot=slot,
+        )
+        if player is None:
+            continue
+        samples.append({"summary": summary, "match": details, "player": player})
+    return samples
+
+
+def hero_sample_metrics(samples: list[dict[str, Any]]) -> dict[str, float]:
+    if not samples:
+        return {"games": 0.0, "wins": 0.0, "win_rate": 0.0}
+    totals = {
+        "wins": 0.0,
+        "kills": 0.0,
+        "deaths": 0.0,
+        "assists": 0.0,
+        "gold_per_min": 0.0,
+        "xp_per_min": 0.0,
+        "last_hits": 0.0,
+        "hero_damage": 0.0,
+        "tower_damage": 0.0,
+        "duration_minutes": 0.0,
+    }
+    for sample in samples:
+        player = sample["player"]
+        match = sample["match"]
+        radiant = int(player.get("player_slot") or 0) < 128
+        totals["wins"] += float(bool(match.get("radiant_win")) == radiant)
+        for key in (
+            "kills",
+            "deaths",
+            "assists",
+            "gold_per_min",
+            "xp_per_min",
+            "last_hits",
+            "hero_damage",
+            "tower_damage",
+        ):
+            totals[key] += numeric_value(player.get(key))
+        totals["duration_minutes"] += numeric_value(match.get("duration")) / 60.0
+    games = float(len(samples))
+    result = {"games": games, "wins": totals["wins"]}
+    result["win_rate"] = totals["wins"] * 100.0 / games
+    for key, value in totals.items():
+        if key != "wins":
+            result[key] = value / games
+    return result
+
+
+def _metric_cell(metrics: dict[str, float], key: str, *, integer: bool = False) -> str:
+    value = float(metrics.get(key) or 0.0)
+    return f"{value:.0f}" if integer else f"{value:.1f}"
+
+
+def build_hero_training_report(
+    hero_id: int,
+    hero_display_name: str,
+    personal_samples: list[dict[str, Any]],
+    benchmark_samples: list[dict[str, Any]],
+    comparison_source: str,
+) -> str:
+    own = hero_sample_metrics(personal_samples)
+    benchmark = hero_sample_metrics(benchmark_samples)
+    source_names = {"self": "仅分析个人近期趋势", "pro": "职业比赛", "high_rank": "高分路人局"}
+    lines = [
+        f"# {hero_display_name} · 英雄专项复盘",
+        "",
+        f"- 生成时间：{datetime.now().astimezone().isoformat(timespec='minutes')}",
+        f"- 个人样本：最近 {int(own.get('games') or 0)} 局",
+        f"- 对比方式：{source_names.get(comparison_source, comparison_source)}",
+        f"- 对比样本：{int(benchmark.get('games') or 0)} 局" if benchmark_samples else "- 对比样本：未启用",
+        "",
+        "## 样本总览",
+        "",
+        "| 样本 | 场次 | 胜率 | K / D / A | GPM | XPM | 场均补刀 | 场均英雄伤害 | 场均建筑伤害 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            f"| 你的近期对局 | {int(own.get('games') or 0)} | {own.get('win_rate', 0):.1f}% | "
+            f"{_metric_cell(own, 'kills')} / {_metric_cell(own, 'deaths')} / {_metric_cell(own, 'assists')} | "
+            f"{_metric_cell(own, 'gold_per_min', integer=True)} | {_metric_cell(own, 'xp_per_min', integer=True)} | "
+            f"{_metric_cell(own, 'last_hits', integer=True)} | {_metric_cell(own, 'hero_damage', integer=True)} | "
+            f"{_metric_cell(own, 'tower_damage', integer=True)} |"
+        ),
+    ]
+    if benchmark_samples:
+        lines.append(
+            f"| {source_names.get(comparison_source, comparison_source)} | {int(benchmark.get('games') or 0)} | "
+            f"{benchmark.get('win_rate', 0):.1f}% | {_metric_cell(benchmark, 'kills')} / "
+            f"{_metric_cell(benchmark, 'deaths')} / {_metric_cell(benchmark, 'assists')} | "
+            f"{_metric_cell(benchmark, 'gold_per_min', integer=True)} | "
+            f"{_metric_cell(benchmark, 'xp_per_min', integer=True)} | "
+            f"{_metric_cell(benchmark, 'last_hits', integer=True)} | "
+            f"{_metric_cell(benchmark, 'hero_damage', integer=True)} | "
+            f"{_metric_cell(benchmark, 'tower_damage', integer=True)} |"
+        )
+    lines += ["", "## 每局记录", ""]
+    for index, sample in enumerate(personal_samples, start=1):
+        player = sample["player"]
+        match = sample["match"]
+        radiant = int(player.get("player_slot") or 0) < 128
+        result = "胜" if bool(match.get("radiant_win")) == radiant else "负"
+        played_at = datetime.fromtimestamp(int(match.get("start_time") or 0)).astimezone().strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"- **个人 {index}**｜{played_at}｜Match `{match.get('match_id')}`｜{result}｜"
+            f"KDA {int(numeric_value(player.get('kills')))}/{int(numeric_value(player.get('deaths')))}/"
+            f"{int(numeric_value(player.get('assists')))}｜GPM {int(numeric_value(player.get('gold_per_min')))}｜"
+            f"补刀 {int(numeric_value(player.get('last_hits')))}"
+        )
+    if benchmark_samples:
+        lines += ["", "## 对比样本记录", ""]
+        for index, sample in enumerate(benchmark_samples, start=1):
+            player = sample["player"]
+            match = sample["match"]
+            lines.append(
+                f"- **对比 {index}**｜Match `{match.get('match_id')}`｜"
+                f"KDA {int(numeric_value(player.get('kills')))}/{int(numeric_value(player.get('deaths')))}/"
+                f"{int(numeric_value(player.get('assists')))}｜GPM {int(numeric_value(player.get('gold_per_min')))}｜"
+                f"补刀 {int(numeric_value(player.get('last_hits')))}"
+            )
+        gaps = [
+            ("GPM", own.get("gold_per_min", 0) - benchmark.get("gold_per_min", 0), "经济效率"),
+            ("XPM", own.get("xp_per_min", 0) - benchmark.get("xp_per_min", 0), "经验效率"),
+            ("场均补刀", own.get("last_hits", 0) - benchmark.get("last_hits", 0), "收线与野区规划"),
+            ("场均死亡", own.get("deaths", 0) - benchmark.get("deaths", 0), "站位与撤退时机"),
+            ("场均建筑伤害", own.get("tower_damage", 0) - benchmark.get("tower_damage", 0), "赢团后的目标转化"),
+        ]
+        lines += ["", "## 优先检查的差距", ""]
+        for label, gap, meaning in gaps:
+            direction = "高于" if gap >= 0 else "低于"
+            lines.append(f"- **{label}**：你的样本{direction}对比样本 {abs(gap):.1f}；重点检查{meaning}。")
+    lines += [
+        "",
+        "## 给 AI 教练的任务",
+        "",
+        "请结合每局原始数据判断趋势，不要只比较平均 KDA。重点分析英雄职责、打钱路线、关键装备时机、团战切入、技能释放、死亡原因和赢团后的地图目标。对职业/高分样本的差异要考虑比赛节奏与位置差异，不能机械照抄。最后给出三条可量化训练任务。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def run_hero_training(
+    args: argparse.Namespace,
+    *,
+    script_dir: Path,
+    settings_path: Path,
+) -> int:
+    account_id = load_saved_account_id(settings_path)
+    if account_id is None:
+        print("英雄专项复盘需要先在连接设置中绑定 Dota 好友代码。", file=sys.stderr)
+        return 2
+    hero_id = int(args.hero_review)
+    own_count = int(args.history_count)
+    benchmark_count = int(args.benchmark_count)
+    comparison_source = str(args.compare_source)
+    output_root = args.output_root or (script_dir / "reports")
+    if not output_root.is_absolute():
+        output_root = Path.cwd() / output_root
+    try:
+        heroes = load_constant("heroes", script_dir / ".cache")
+        hero_by_id, _ = make_hero_maps(heroes)
+        hero_display = hero_name(hero_id, hero_by_id)
+        print(f"正在读取你使用 {hero_display} 的最近 {own_count} 局比赛 …")
+        personal_rows = fetch_player_hero_matches(account_id, hero_id, own_count)
+        personal_samples = fetch_hero_sample_details(
+            personal_rows, hero_id, account_id=account_id
+        )
+        if not personal_samples:
+            raise OpenDotaError("没有取得该英雄的公开比赛记录，请检查公开比赛数据设置。")
+        benchmark_rows: list[dict[str, Any]] = []
+        if comparison_source == "pro":
+            print(f"正在查找 {benchmark_count} 场近期职业比赛作为对比 …")
+            benchmark_rows = fetch_pro_hero_matches(hero_id, benchmark_count)
+        elif comparison_source == "high_rank":
+            print(f"正在查找 {benchmark_count} 场近期高分路人局作为对比 …")
+            benchmark_rows = fetch_high_rank_hero_matches(hero_id, benchmark_count)
+        benchmark_samples = fetch_hero_sample_details(benchmark_rows, hero_id)
+        if comparison_source != "self" and not benchmark_samples:
+            raise OpenDotaError("没有找到可用的职业/高分同英雄样本，请稍后重试或改用个人趋势模式。")
+        report = build_hero_training_report(
+            hero_id,
+            hero_display,
+            personal_samples,
+            benchmark_samples,
+            comparison_source,
+        )
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M")
+        safe_hero = safe_filename(hero_display)
+        study_dir = output_root / "hero_studies" / f"{timestamp}_{safe_hero}_{own_count}局"
+        study_dir.mkdir(parents=True, exist_ok=True)
+        report_path = study_dir / f"{safe_hero}_英雄专项复盘.md"
+        raw_path = study_dir / f"{safe_hero}_专项样本.json"
+        report_path.write_text(report, encoding="utf-8-sig", newline="\n")
+        raw_path.write_text(
+            json.dumps(
+                {"hero_id": hero_id, "personal": personal_samples, "benchmark": benchmark_samples},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8-sig",
+            newline="\n",
+        )
+        if not args.no_ai_review:
+            ai_config = load_ai_settings(script_dir / "ai_settings.json")
+            if ai_config is None:
+                print("尚未配置 AI，本次已生成基础专项报告。")
+            else:
+                print("正在进行一次 AI 英雄专项对比复盘 …")
+                ai_text = request_ai_review(ai_config, report)
+                ai_path = study_dir / f"{safe_hero}_AI专项教练复盘.md"
+                ai_path.write_text(ai_text, encoding="utf-8-sig", newline="\n")
+                print(f"AI 专项复盘已生成：{ai_path}")
+        print(f"英雄专项复盘已生成：{report_path}")
+        return 0
+    except (OpenDotaError, AIReviewError) as exc:
+        print(f"英雄专项复盘失败：{exc}", file=sys.stderr)
+        return 4 if isinstance(exc, OpenDotaError) else 8
+    except OSError as exc:
+        print(f"写入英雄专项复盘失败：{exc}", file=sys.stderr)
+        return 5
+
+
 def run_daily_review(
     args: argparse.Namespace,
     *,
@@ -2527,7 +2864,10 @@ def run_daily_review(
     for label, match in selected:
         print("  " + match_selection_summary(label, match, hero_by_id).removeprefix("- "))
 
-    output_dir = script_dir / "reports" / "daily" / target_date.isoformat()
+    daily_root = args.output_root or (script_dir / "reports")
+    if not daily_root.is_absolute():
+        daily_root = Path.cwd() / daily_root
+    output_dir = daily_root / "daily" / target_date.isoformat()
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -2578,7 +2918,7 @@ def run_daily_review(
         )
         try:
             removed, reclaimed = delete_generated_tree(
-                output_dir, script_dir / "reports" / "daily"
+                output_dir, daily_root / "daily"
             )
             if removed:
                 print(
@@ -2760,7 +3100,7 @@ def run_daily_review(
     if delivery_complete:
         try:
             removed, reclaimed = delete_generated_tree(
-                output_dir, script_dir / "reports" / "daily"
+                output_dir, daily_root / "daily"
             )
             print(
                 f"主推送或备用渠道已确认接收，已删除本次本地临时文件 {removed} 个，"
@@ -2793,6 +3133,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--daily",
         action="store_true",
         help="自动选取指定日期表现最好和最差的比赛并生成每日双局复盘包",
+    )
+    parser.add_argument(
+        "--hero-review",
+        type=int,
+        metavar="英雄ID",
+        help="生成指定英雄的个人近期趋势或职业/高分样本对比复盘",
+    )
+    parser.add_argument(
+        "--history-count",
+        type=int,
+        choices=HERO_HISTORY_COUNTS,
+        default=5,
+        help="英雄专项复盘使用自己的最近 3、5 或 10 局，默认 5",
+    )
+    parser.add_argument(
+        "--compare-source",
+        choices=("self", "pro", "high_rank"),
+        default="self",
+        help="英雄专项的对比方式：个人趋势、职业比赛或高分路人局",
+    )
+    parser.add_argument(
+        "--benchmark-count",
+        type=int,
+        choices=HERO_BENCHMARK_COUNTS,
+        default=3,
+        help="职业/高分对比样本使用最近 3 或 5 局，默认 3",
     )
     parser.add_argument(
         "--day-offset",
@@ -3160,6 +3526,12 @@ def run(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(f"设置保存失败：{exc}", file=sys.stderr)
             return 5
+
+    if args.hero_review is not None:
+        if args.match_id or args.steam or args.my_matches or args.daily:
+            print("输入错误：英雄专项模式不能和 Match ID、最近比赛或每日模式同时使用。", file=sys.stderr)
+            return 2
+        return run_hero_training(args, script_dir=script_dir, settings_path=settings_path)
 
     if args.daily:
         if args.match_id or args.steam or args.my_matches:

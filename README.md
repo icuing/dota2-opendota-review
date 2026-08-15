@@ -6,27 +6,42 @@
 
 ![连接与设置](docs/screenshots/windows-settings.png)
 
-## v1.6.1 重点更新
+## v1.7.0 重点更新
 
-- AI 不再只复述 KDA 或分析死亡，而会先判断英雄位置与本局胜利责任。
-- 核心位（C 位）逐项检查打钱节奏、关键装备强势期、团战切入、技能释放、目标转化。
-- 辅助与功能位改为检查视野、开团/反手、保护核心、支援和资源占用。
-- 证据包加入 10/15/20/25/30 分钟发育节点、队内排名、五分钟高低效窗口、关键装备时间、逐次团战技能/道具使用和地图转化数据。
-- 关键死亡会分析敌方强势来源、可能的技能链、撤退/站位选择，以及下次可执行的行动口令；数据无法证明时明确标为推测。
-- 装备和技能优先输出简体中文名称。
-- Windows 新增参考现版 Dota 2 主菜单配色关系的 GUI；黑金烟雾、石墨导航、暗棕面板与绿色主按钮为主，两侧为原创冰霜射手/森林弓手同人风格看板娘。
-- 服务商、模型和推理强度使用带 `▼` 标识的下拉框；模型框仍允许手动输入平台支持的自定义模型。
-- Windows GUI 可在 00:00–23:59 之间选择每日复盘时间，之后可修改或停用。
-- 单场和每日任务均支持个人微信主推送；只有微信未确认发送成功时才改用 Telegram。
+- PC 版新增“英雄训练”页面，可选择任意英雄并复盘自己最近 3、5 或 10 局。
+- 可选择只分析自己的近期趋势，或加入最近 3 / 5 场职业比赛、高分路人局进行同英雄对比。
+- 英雄专项模式只进行一次综合 AI 调用，避免对每场样本分别收费；同时保存 Markdown 报告和原始样本 JSON。
+- PC 版可自由选择复盘记录目录；单场、每日定时和英雄专项任务统一写入该位置。
+
+以往版本的功能变化完整保留在 [`CHANGELOG.md`](CHANGELOG.md)，本节只展示当前版本新增内容。
 
 ## Windows：小白直接使用
 
-1. 下载仓库 `dist` 目录中的 [`dota2-opendota-review-v1.6.1-windows.zip`](dist/dota2-opendota-review-v1.6.1-windows.zip)。
-2. 解压后把 `Dota2ReviewCoach-v1.6.1.exe` 放入一个长期使用的文件夹。
+1. 下载仓库 `dist` 目录中的 [`dota2-opendota-review-v1.7.0-windows.zip`](dist/dota2-opendota-review-v1.7.0-windows.zip)。
+2. 解压后把 `Dota2ReviewCoach-v1.7.0.exe` 放入一个长期使用的文件夹。
 3. 双击运行，进入“连接设置”。
 4. 依次设置 Dota 好友代码或 SteamID64、OpenAI/DeepSeek API、Server酱 SendKey，以及可选的 Telegram 备用渠道。
 5. 回到“战局复盘”：输入 Match ID 生成单场复盘，或点击“运行每日复盘”。启用状态会显示清晰的绿色 `✔`。
 6. 需要自动运行时，点击每日代表局下方的“设置 / 修改时间”，选择小时和分钟后保存。
+
+### 英雄专项训练
+
+1. 在顶部进入“英雄训练”。
+2. 从下拉列表选择英雄，再选择自己的近期样本：3、5 或 10 局。
+3. 选择对比方式：
+   - **仅分析个人近期趋势**：比较自己这些比赛中的发挥变化；
+   - **对比近期职业比赛**：额外读取最近 3 或 5 场职业同英雄比赛；
+   - **对比近期高分路人局**：额外读取最近 3 或 5 场高分公开同英雄比赛。
+4. 在“复盘记录存放位置”点击“选择文件夹”。该选择会保存，之后单场、每日和英雄专项均使用此目录。
+5. 点击“生成英雄专项复盘”。报告位于所选目录的 `hero_studies` 子目录。
+
+对比报告会汇总胜率、KDA、GPM、XPM、补刀、英雄伤害与建筑伤害，并保留每场 Match ID。职业/高分数据是参考样本，AI 会考虑比赛节奏与位置差异，不会要求玩家机械照抄职业出装。OpenDota 可能暂时没有某个冷门英雄的近期职业样本，此时可改用高分路人或个人趋势模式。
+
+命令行也可使用：
+
+```powershell
+py dota2_review.py --hero-review 8 --history-count 10 --compare-source high_rank --benchmark-count 5 --output-root D:\Dota复盘
+```
 
 API Key、SendKey 和 Telegram Token 只保存在 EXE 所在目录的本地 JSON 设置文件中，不显示在界面日志和复盘报告里。调用 AI 会产生对应平台的 API 费用；连接测试只发送极小请求。
 
@@ -102,6 +117,8 @@ python3 dota2_review.py 8943397976 --send --parse-timeout 60 --no-open-project
 旧参数 `--send-telegram` 仍兼容，但同样执行“微信优先、Telegram 兜底”。
 
 ## iStoreOS / OpenWrt 完整更新与安装
+
+下载 [`dota2-opendota-review-v1.7.0-openwrt.zip`](dist/dota2-opendota-review-v1.7.0-openwrt.zip)。这是不含 GUI、图片与 Windows 运行时的精简包。
 
 建议放在持久化磁盘，例如 `/mnt/data_sda3/dota2-review`，不要放进固件临时目录。
 

@@ -16,7 +16,7 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 from tkinter import END, BOTH, LEFT, RIGHT, X, Y, BooleanVar, IntVar, StringVar, Tk, Toplevel
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
 import dota2_review as core
@@ -61,6 +61,7 @@ AI_MODEL_OPTIONS = {
 REASONING_EFFORT_OPTIONS = ("low", "medium", "high", "max")
 WINDOWS_TASK_NAME = "Dota2 Review Coach Daily"
 SCHEDULE_SETTINGS_FILE = "schedule_settings.json"
+PC_SETTINGS_FILE = "pc_settings.json"
 
 
 def model_options(provider: str) -> tuple[str, ...]:
@@ -98,6 +99,63 @@ def save_schedule_settings(path: Path, *, enabled: bool, run_time: str) -> None:
         ) + "\n",
         encoding="utf-8",
     )
+
+
+def load_pc_settings(path: Path) -> dict[str, str]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    output_root = str(raw.get("output_root") or "").strip()
+    return {"output_root": output_root} if output_root else {}
+
+
+def save_pc_settings(path: Path, *, output_root: str) -> None:
+    root = str(Path(output_root).expanduser().resolve())
+    path.write_text(
+        json.dumps({"output_root": root}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def hero_options() -> tuple[tuple[str, int], ...]:
+    names = core.load_chinese_hero_names()
+    return tuple(sorted(((name, hero_id) for hero_id, name in names.items()), key=lambda row: row[0]))
+
+
+def build_hero_run_args(
+    *,
+    hero_id: int,
+    history_count: int,
+    compare_source: str,
+    benchmark_count: int,
+    output_root: str = "",
+    enable_ai: bool = True,
+) -> list[str]:
+    if history_count not in core.HERO_HISTORY_COUNTS:
+        raise ValueError("个人样本只能选择 3、5 或 10 局。")
+    if benchmark_count not in core.HERO_BENCHMARK_COUNTS:
+        raise ValueError("对比样本只能选择 3 或 5 局。")
+    if compare_source not in {"self", "pro", "high_rank"}:
+        raise ValueError("请选择有效的对比方式。")
+    args = [
+        "--hero-review",
+        str(int(hero_id)),
+        "--history-count",
+        str(history_count),
+        "--compare-source",
+        compare_source,
+        "--benchmark-count",
+        str(benchmark_count),
+        "--no-open-project",
+    ]
+    if output_root:
+        args += ["--output-root", str(Path(output_root).expanduser().resolve())]
+    if not enable_ai:
+        args.append("--no-ai-review")
+    return args
 
 
 def scheduled_run_command() -> str:
@@ -157,6 +215,7 @@ def build_run_args(
     day_offset: int = 1,
     enable_ai: bool = True,
     enable_push: bool = True,
+    output_root: str = "",
 ) -> list[str]:
     if daily:
         args = ["--daily", "--day-offset", str(day_offset)]
@@ -168,6 +227,8 @@ def build_run_args(
             args.append("--send-telegram")
     if not enable_ai:
         args.append("--no-ai-review")
+    if output_root:
+        args += ["--output-root", str(Path(output_root).expanduser().resolve())]
     args.append("--no-open-project")
     return args
 
@@ -198,6 +259,12 @@ class ReviewApp:
         self.page_name = "review"
         self.pages: dict[str, tk.Frame] = {}
         self.nav_buttons: dict[str, tk.Button] = {}
+        self.hero_rows = hero_options()
+        self.hero_name_to_id = {name: hero_id for name, hero_id in self.hero_rows}
+        pc_settings = load_pc_settings(self.app_dir / PC_SETTINGS_FILE)
+        self.output_root_var = StringVar(
+            value=pc_settings.get("output_root", str(self.app_dir / "reports"))
+        )
 
         root.title(f"Dota 2 复盘教练 · v{core.APP_VERSION}")
         root.geometry("1760x960")
@@ -357,6 +424,7 @@ class ReviewApp:
         nav.pack(side=RIGHT, padx=24, pady=26)
         nav_items = [
             ("review", "战局复盘"),
+            ("hero", "英雄训练"),
             ("settings", "连接设置"),
             ("logs", "战报日志"),
         ]
@@ -402,6 +470,7 @@ class ReviewApp:
         self.content = tk.Frame(main, bg=COLORS["sidebar"])
         self.content.pack(fill=BOTH, expand=True, padx=30, pady=(0, 26))
         self._build_review_page()
+        self._build_hero_page()
         self._build_settings_page()
         self._build_logs_page()
 
@@ -629,6 +698,130 @@ class ReviewApp:
         )
         self.progress.pack(fill=X, padx=22, pady=(8, 16))
 
+    def _build_hero_page(self) -> None:
+        page = tk.Frame(self.content, bg=COLORS["sidebar"])
+        self.pages["hero"] = page
+
+        intro = self._panel(page)
+        intro.pack(fill=X, pady=(0, 16))
+        tk.Label(
+            intro,
+            text="选择英雄，建立可追踪的个人样本",
+            bg=COLORS["panel"],
+            fg=COLORS["gold_bright"],
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).pack(anchor="w", padx=22, pady=(18, 6))
+        tk.Label(
+            intro,
+            text=(
+                "一次读取你使用该英雄的最近 3 / 5 / 10 局；可只分析个人趋势，"
+                "也可加入最近 3 / 5 场职业比赛或高分路人局作为参考。AI 只调用一次完成综合复盘。"
+            ),
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            wraplength=900,
+            justify="left",
+            font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w", padx=22, pady=(0, 18))
+
+        controls = self._panel(page)
+        controls.pack(fill=X, pady=(0, 16))
+        form = tk.Frame(controls, bg=COLORS["panel"])
+        form.pack(fill=X, padx=22, pady=20)
+        for column in range(4):
+            form.grid_columnconfigure(column, weight=1 if column in (0, 2) else 0)
+
+        hero_names = [name for name, _hero_id in self.hero_rows]
+        self.hero_name_var = StringVar(value=hero_names[0] if hero_names else "")
+        self.hero_history_count_var = IntVar(value=5)
+        self.hero_compare_label_var = StringVar(value="仅分析个人近期趋势")
+        self.hero_benchmark_count_var = IntVar(value=3)
+        self.hero_ai_var = BooleanVar(value=True)
+
+        def label(text: str, row: int, column: int) -> None:
+            tk.Label(
+                form,
+                text=text,
+                bg=COLORS["panel"],
+                fg=COLORS["muted"],
+                font=("Microsoft YaHei UI", 9, "bold"),
+            ).grid(row=row, column=column, sticky="w", pady=(0, 6), padx=(0, 12))
+
+        label("英雄  ▼", 0, 0)
+        label("我的近期样本  ▼", 0, 2)
+        ttk.Combobox(
+            form,
+            textvariable=self.hero_name_var,
+            values=hero_names,
+            state="readonly",
+            style="Coach.TCombobox",
+            width=28,
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 22))
+        ttk.Combobox(
+            form,
+            textvariable=self.hero_history_count_var,
+            values=list(core.HERO_HISTORY_COUNTS),
+            state="readonly",
+            style="Coach.TCombobox",
+            width=8,
+        ).grid(row=1, column=2, sticky="ew")
+
+        label("对比方式  ▼", 2, 0)
+        label("职业 / 高分样本  ▼", 2, 2)
+        ttk.Combobox(
+            form,
+            textvariable=self.hero_compare_label_var,
+            values=["仅分析个人近期趋势", "对比近期职业比赛", "对比近期高分路人局"],
+            state="readonly",
+            style="Coach.TCombobox",
+            width=28,
+        ).grid(row=3, column=0, sticky="ew", padx=(0, 22))
+        ttk.Combobox(
+            form,
+            textvariable=self.hero_benchmark_count_var,
+            values=list(core.HERO_BENCHMARK_COUNTS),
+            state="readonly",
+            style="Coach.TCombobox",
+            width=8,
+        ).grid(row=3, column=2, sticky="ew")
+
+        storage = self._panel(page)
+        storage.pack(fill=X)
+        tk.Label(
+            storage,
+            text="复盘记录存放位置",
+            bg=COLORS["panel"],
+            fg=COLORS["text"],
+            font=("Microsoft YaHei UI", 13, "bold"),
+        ).pack(anchor="w", padx=22, pady=(18, 5))
+        tk.Label(
+            storage,
+            text="选择后会保存设置；单场、每日和英雄专项复盘都会使用该目录。",
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w", padx=22)
+        path_row = tk.Frame(storage, bg=COLORS["panel"])
+        path_row.pack(fill=X, padx=22, pady=(14, 10))
+        ttk.Entry(
+            path_row,
+            textvariable=self.output_root_var,
+            style="Coach.TEntry",
+            font=("Segoe UI", 10),
+        ).pack(side=LEFT, fill=X, expand=True, padx=(0, 10))
+        self._action_button(
+            path_row, "选择文件夹", self.choose_output_root, primary=False, width=12
+        ).pack(side=RIGHT)
+        action_row = tk.Frame(storage, bg=COLORS["panel"])
+        action_row.pack(fill=X, padx=22, pady=(0, 18))
+        self._toggle_control(
+            action_row, "启用付费 AI 综合复盘", self.hero_ai_var
+        ).pack(side=LEFT)
+        self.hero_run_button = self._action_button(
+            action_row, "生成英雄专项复盘", self.run_hero_training_gui, primary=True, width=18
+        )
+        self.hero_run_button.pack(side=RIGHT)
+
     def _build_settings_page(self) -> None:
         page = tk.Frame(self.content, bg=COLORS["sidebar"])
         self.pages["settings"] = page
@@ -759,6 +952,7 @@ class ReviewApp:
         self.page_name = name
         titles = {
             "review": ("开始复盘", "从公开比赛数据中提炼下一局能执行的改进动作"),
+            "hero": ("英雄专项训练", "复盘自己的近期样本，并与职业或高分同英雄对局进行对比"),
             "settings": ("连接与设置", "密钥仅保存在本机，不显示在日志与报告中"),
             "logs": ("运行日志", "查看解析、AI 复盘和推送进度"),
         }
@@ -803,6 +997,7 @@ class ReviewApp:
         state = "disabled" if running else "normal"
         self.run_match_button.configure(state=state)
         self.run_daily_button.configure(state=state)
+        self.hero_run_button.configure(state=state)
         if running:
             self.progress.start(12)
         else:
@@ -834,6 +1029,7 @@ class ReviewApp:
                 match_id=self.match_var.get(),
                 enable_ai=self.enable_ai_var.get(),
                 enable_push=self.enable_push_var.get(),
+                output_root=self.output_root_var.get(),
             )
         except ValueError as exc:
             messagebox.showerror("Match ID 无效", str(exc), parent=self.root)
@@ -846,8 +1042,55 @@ class ReviewApp:
             day_offset=int(self.day_offset_var.get()),
             enable_ai=self.enable_ai_var.get(),
             enable_push=self.enable_push_var.get(),
+            output_root=self.output_root_var.get(),
         )
         self._start_job("开始每日代表局复盘", lambda: core.run(args))
+
+    def choose_output_root(self) -> None:
+        selected = filedialog.askdirectory(
+            parent=self.root,
+            title="选择复盘记录存放文件夹",
+            initialdir=self.output_root_var.get() or str(self.app_dir),
+            mustexist=False,
+        )
+        if not selected:
+            return
+        try:
+            root = Path(selected).expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            save_pc_settings(self.app_dir / PC_SETTINGS_FILE, output_root=str(root))
+            self.output_root_var.set(str(root))
+        except OSError as exc:
+            messagebox.showerror("保存目录失败", str(exc), parent=self.root)
+
+    def run_hero_training_gui(self) -> None:
+        hero_name_value = self.hero_name_var.get().strip()
+        hero_id = self.hero_name_to_id.get(hero_name_value)
+        if hero_id is None:
+            messagebox.showerror("请选择英雄", "请从下拉列表中选择一个英雄。", parent=self.root)
+            return
+        source_map = {
+            "仅分析个人近期趋势": "self",
+            "对比近期职业比赛": "pro",
+            "对比近期高分路人局": "high_rank",
+        }
+        try:
+            output_root = self.output_root_var.get().strip()
+            if output_root:
+                Path(output_root).expanduser().resolve().mkdir(parents=True, exist_ok=True)
+                save_pc_settings(self.app_dir / PC_SETTINGS_FILE, output_root=output_root)
+            args = build_hero_run_args(
+                hero_id=hero_id,
+                history_count=int(self.hero_history_count_var.get()),
+                compare_source=source_map[self.hero_compare_label_var.get()],
+                benchmark_count=int(self.hero_benchmark_count_var.get()),
+                output_root=output_root,
+                enable_ai=self.hero_ai_var.get(),
+            )
+        except (KeyError, OSError, ValueError) as exc:
+            messagebox.showerror("英雄专项设置无效", str(exc), parent=self.root)
+            return
+        self._start_job(f"开始 {hero_name_value} 英雄专项复盘", lambda: core.run(args))
 
     def configure_schedule(self) -> None:
         dialog, body = self._dialog("Windows 每日定时复盘", width=600, height=430)
@@ -989,7 +1232,7 @@ class ReviewApp:
         self.log_text.delete("1.0", END)
 
     def open_reports(self) -> None:
-        reports = self.app_dir / "reports"
+        reports = Path(self.output_root_var.get() or (self.app_dir / "reports")).expanduser().resolve()
         reports.mkdir(parents=True, exist_ok=True)
         webbrowser.open(reports.as_uri())
 
@@ -1314,14 +1557,18 @@ def main(argv: list[str] | None = None) -> int:
         with log_path.open("a", encoding="utf-8") as stream:
             with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
                 print(f"\n[{datetime.now().isoformat(timespec='seconds')}] Windows 定时复盘开始")
-                result = core.run(
-                    [
-                        "--daily",
-                        "--day-offset",
-                        str(args.day_offset),
-                        "--no-open-project",
-                    ]
-                )
+                run_args = [
+                    "--daily",
+                    "--day-offset",
+                    str(args.day_offset),
+                    "--no-open-project",
+                ]
+                output_root = load_pc_settings(
+                    core.application_dir() / PC_SETTINGS_FILE
+                ).get("output_root")
+                if output_root:
+                    run_args += ["--output-root", output_root]
+                result = core.run(run_args)
                 print(f"Windows 定时复盘结束，退出代码 {result}")
                 return result
     root = Tk()
@@ -1330,6 +1577,7 @@ def main(argv: list[str] | None = None) -> int:
         root.update_idletasks()
         root.update()
         assert app.pages["review"].winfo_exists()
+        assert app.pages["hero"].winfo_exists()
         assert app.pages["settings"].winfo_exists()
         assert app.pages["logs"].winfo_exists()
         root.destroy()

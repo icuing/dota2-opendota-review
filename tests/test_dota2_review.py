@@ -17,11 +17,14 @@ from dota2_review import (  # noqa: E402
     ability_name,
     build_team_gold_curve,
     build_match_artifact_stem,
+    build_hero_training_report,
     build_parser,
     cleanup_old_downloads,
     delete_generated_tree,
     generate_report,
+    hero_sample_metrics,
     find_latest_private_chat,
+    fetch_high_rank_hero_matches,
     lead_change_minutes,
     load_ai_settings,
     load_serverchan_settings,
@@ -32,6 +35,7 @@ from dota2_review import (  # noqa: E402
     open_chatgpt_handoff,
     parsed_sections,
     player_match_won,
+    public_match_contains_hero,
     resolve_steam_account_id,
     purge_generated_data,
     request_ai_review,
@@ -92,6 +96,59 @@ def make_player(slot, hero_id, gold, *, death_time=None):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_public_match_hero_filter_checks_both_teams(self):
+        match = {"radiant_team": [1, 2, 3, 4, 5], "dire_team": [6, 7, 8, 9, 10]}
+        self.assertTrue(public_match_contains_hero(match, 3))
+        self.assertTrue(public_match_contains_hero(match, 9))
+        self.assertFalse(public_match_contains_hero(match, 42))
+
+    @patch("dota2_review.request_json")
+    def test_high_rank_hero_matches_filter_and_paginate(self, request):
+        request.side_effect = [
+            [
+                {"match_id": 200, "radiant_team": [1, 2], "dire_team": [3, 4]},
+                {"match_id": 190, "radiant_team": [8, 2], "dire_team": [3, 4]},
+            ],
+            [
+                {"match_id": 180, "radiant_team": [1, 2], "dire_team": [8, 4]},
+            ],
+        ]
+        rows = fetch_high_rank_hero_matches(8, 2)
+        self.assertEqual([row["match_id"] for row in rows], [190, 180])
+        self.assertIn("min_rank=80", request.call_args_list[0].args[0])
+        self.assertIn("less_than_match_id=190", request.call_args_list[1].args[0])
+
+    def test_hero_sample_metrics_and_report(self):
+        samples = [
+            {
+                "summary": {"match_id": 9000000001},
+                "match": {
+                    "match_id": 9000000001,
+                    "radiant_win": True,
+                    "start_time": 1700000000,
+                    "duration": 2400,
+                },
+                "player": {
+                    "player_slot": 0,
+                    "kills": 8,
+                    "deaths": 2,
+                    "assists": 10,
+                    "gold_per_min": 650,
+                    "xp_per_min": 700,
+                    "last_hits": 280,
+                    "hero_damage": 24000,
+                    "tower_damage": 5000,
+                },
+            }
+        ]
+        metrics = hero_sample_metrics(samples)
+        self.assertEqual(metrics["win_rate"], 100.0)
+        self.assertEqual(metrics["gold_per_min"], 650.0)
+        report = build_hero_training_report(8, "主宰", samples, samples, "pro")
+        self.assertIn("主宰 · 英雄专项复盘", report)
+        self.assertIn("职业比赛", report)
+        self.assertIn("优先检查的差距", report)
+
     def setUp(self):
         radiant_gold = [600, 1000, 1600, 2200, 2800, 3400] + [3400] * 25
         dire_gold = [600, 1100, 1700, 2100, 2700, 3200] + [3200] * 25

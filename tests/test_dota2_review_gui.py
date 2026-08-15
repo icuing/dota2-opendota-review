@@ -6,16 +6,49 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dota2_review_gui import (  # noqa: E402
+    build_hero_run_args,
     build_run_args,
+    load_pc_settings,
     load_schedule_settings,
     masked_status,
     model_options,
     save_schedule_settings,
+    save_pc_settings,
     validate_schedule_time,
 )
 
 
 class GuiTests(unittest.TestCase):
+    def test_hero_training_arguments(self):
+        args = build_hero_run_args(
+            hero_id=8,
+            history_count=10,
+            compare_source="high_rank",
+            benchmark_count=5,
+            output_root="",
+            enable_ai=False,
+        )
+        self.assertEqual(
+            args,
+            [
+                "--hero-review", "8",
+                "--history-count", "10",
+                "--compare-source", "high_rank",
+                "--benchmark-count", "5",
+                "--no-open-project",
+                "--no-ai-review",
+            ],
+        )
+
+    def test_pc_settings_round_trip(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "pc_settings.json"
+            output = Path(temp_dir) / "reports"
+            save_pc_settings(path, output_root=str(output))
+            self.assertEqual(load_pc_settings(path)["output_root"], str(output.resolve()))
+
     def test_single_match_arguments(self):
         self.assertEqual(
             build_run_args(

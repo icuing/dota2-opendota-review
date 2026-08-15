@@ -13,6 +13,7 @@ ai_settings.json
 serverchan_settings.json
 daily_state.json
 schedule_settings.json
+pc_settings.json
 
 # Local release archives and editor/system files.
 *.zip
