@@ -12,6 +12,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dota2_review import (  # noqa: E402
+    AI_COACH_INSTRUCTIONS,
+    AIReviewError,
+    ability_name,
     build_team_gold_curve,
     build_match_artifact_stem,
     build_parser,
@@ -20,18 +23,26 @@ from dota2_review import (  # noqa: E402
     generate_report,
     find_latest_private_chat,
     lead_change_minutes,
+    load_ai_settings,
+    load_serverchan_settings,
+    load_zh_names,
     load_settings,
     make_chatgpt_bundle,
+    notify_wechat_primary_with_telegram_fallback,
     open_chatgpt_handoff,
     parsed_sections,
     player_match_won,
     resolve_steam_account_id,
     purge_generated_data,
+    request_ai_review,
     run_daily_review,
     save_account_id,
+    save_ai_settings,
+    save_serverchan_settings,
     save_project_url,
     save_telegram_settings,
     select_daily_representatives,
+    serverchan_send,
     telegram_api_request,
     telegram_match_caption,
     validate_chatgpt_project_url,
@@ -334,6 +345,157 @@ class ReviewTests(unittest.TestCase):
             self.assertEqual(settings["account_id"], 123456789)
             self.assertIn("chatgpt_project_url", settings)
 
+    def test_ai_settings_are_saved_separately_and_loaded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "ai_settings.json"
+            save_ai_settings(
+                settings_path,
+                {
+                    "provider": "openai",
+                    "api_key": "sk-test-secret-key",
+                    "model": "gpt-test",
+                    "reasoning_effort": "medium",
+                },
+            )
+            config = load_ai_settings(settings_path)
+            self.assertIsNotNone(config)
+            self.assertEqual(config["provider"], "openai")
+            self.assertEqual(config["model"], "gpt-test")
+
+    def test_serverchan_settings_are_saved_separately(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "serverchan_settings.json"
+            save_serverchan_settings(settings_path, "SCT1234567890abcdef")
+            config = load_serverchan_settings(settings_path)
+            self.assertIsNotNone(config)
+            self.assertEqual(config["sendkey"], "SCT1234567890abcdef")
+
+    @patch("dota2_review.urlopen")
+    def test_serverchan_sends_markdown_without_logging_key(self, urlopen_mock):
+        response = urlopen_mock.return_value.__enter__.return_value
+        response.read.return_value = b'{"code":0,"message":"success"}'
+        serverchan_send(
+            {"sendkey": "SCT1234567890abcdef"},
+            "Dota 2 测试",
+            "# AI 最终复盘\n\n正文",
+        )
+        request = urlopen_mock.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/SCT1234567890abcdef.send"))
+        self.assertIn(b"desp=", request.data)
+
+    @patch("dota2_review.notify_telegram_if_configured")
+    @patch("dota2_review.notify_serverchan_if_configured", return_value=True)
+    def test_wechat_success_does_not_duplicate_to_telegram(
+        self, wechat_mock, telegram_mock
+    ):
+        sent = notify_wechat_primary_with_telegram_fallback(
+            serverchan_settings_path=Path("serverchan.json"),
+            telegram_settings_path=Path("telegram.json"),
+            wechat_enabled=True,
+            telegram_enabled=True,
+            wechat_title="复盘",
+            wechat_content="正文",
+            telegram_text="备用正文",
+        )
+        self.assertTrue(sent)
+        wechat_mock.assert_called_once()
+        telegram_mock.assert_not_called()
+
+    @patch("dota2_review.notify_telegram_if_configured", return_value=True)
+    @patch("dota2_review.notify_serverchan_if_configured", return_value=False)
+    def test_wechat_failure_falls_back_to_telegram(
+        self, wechat_mock, telegram_mock
+    ):
+        sent = notify_wechat_primary_with_telegram_fallback(
+            serverchan_settings_path=Path("serverchan.json"),
+            telegram_settings_path=Path("telegram.json"),
+            wechat_enabled=True,
+            telegram_enabled=True,
+            wechat_title="复盘",
+            wechat_content="正文",
+            telegram_text="备用正文",
+        )
+        self.assertTrue(sent)
+        wechat_mock.assert_called_once()
+        telegram_mock.assert_called_once()
+
+    @patch("dota2_review._request_ai_json")
+    def test_openai_review_uses_responses_api_shape(self, request_mock):
+        request_mock.return_value = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "复盘完成"}],
+                }
+            ]
+        }
+        result = request_ai_review(
+            {
+                "provider": "openai",
+                "api_key": "sk-test-secret-key",
+                "model": "gpt-test",
+                "reasoning_effort": "medium",
+            },
+            "比赛摘要",
+        )
+        self.assertEqual(result, "复盘完成")
+        url, payload, _key = request_mock.call_args.args
+        self.assertEqual(url, "https://api.openai.com/v1/responses")
+        self.assertEqual(payload["input"], "比赛摘要")
+        self.assertFalse(payload["store"])
+
+    @patch("dota2_review._request_ai_json")
+    def test_deepseek_review_uses_chat_completions_shape(self, request_mock):
+        request_mock.return_value = {
+            "choices": [{"message": {"content": "深度复盘完成"}}]
+        }
+        result = request_ai_review(
+            {
+                "provider": "deepseek",
+                "api_key": "sk-test-secret-key",
+                "model": "deepseek-v4-pro",
+                "reasoning_effort": "high",
+            },
+            "比赛摘要",
+        )
+        self.assertEqual(result, "深度复盘完成")
+        url, payload, _key = request_mock.call_args.args
+        self.assertEqual(url, "https://api.deepseek.com/chat/completions")
+        self.assertEqual(payload["messages"][1]["content"], "比赛摘要")
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+
+    @patch("dota2_review._request_ai_json")
+    def test_deepseek_max_never_downgrades_when_final_content_is_empty(
+        self, request_mock
+    ):
+        request_mock.return_value = {
+            "choices": [
+                {"message": {"reasoning_content": "很长的推理", "content": ""}}
+            ]
+        }
+        with self.assertRaises(AIReviewError):
+            request_ai_review(
+                {
+                    "provider": "deepseek",
+                    "api_key": "sk-test-secret-key",
+                    "model": "deepseek-v4-pro",
+                    "reasoning_effort": "max",
+                },
+                "比赛摘要",
+            )
+        self.assertEqual(request_mock.call_count, 1)
+        payload = request_mock.call_args.args[1]
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertEqual(payload["reasoning_effort"], "max")
+        self.assertEqual(payload["max_tokens"], 64000)
+
+    def test_bundled_chinese_names_cover_items_and_skills(self):
+        names = load_zh_names(Path(__file__).resolve().parents[1])
+        self.assertEqual(names["items"]["solar_crest"], "炎阳纹章")
+        self.assertEqual(
+            ability_name("sven_storm_bolt", names["abilities"]), "风暴之拳"
+        )
+
     def test_set_steam_saves_identifier_without_querying_matches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_script = Path(temp_dir) / "dota2_review.py"
@@ -383,6 +545,72 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("👉 P0", report)
         self.assertIn("军团指挥官", report)
 
+    def test_report_adds_role_farming_and_teamfight_coaching_evidence(self):
+        focus = self.match["players"][0]
+        focus.update(
+            {
+                "lane_role": 2,
+                "lane_efficiency_pct": 78.5,
+                "lh_t": list(range(31)),
+                "teamfight_participation": 0.72,
+                "hero_damage": 18000,
+                "tower_damage": 4200,
+                "life_state_dead": 180,
+                "ability_uses": {"legion_commander_duel": 8},
+                "item_uses": {"blink": 5, "tpscroll": 3},
+                "benchmarks": {
+                    "gold_per_min": {"pct": 0.61},
+                    "last_hits_per_min": {"pct": 0.57},
+                    "hero_damage_per_min": {"pct": 0.66},
+                },
+            }
+        )
+        for index, player in enumerate(self.match["players"]):
+            player.setdefault("hero_damage", 5000 + index)
+            player.setdefault("tower_damage", 1000 + index)
+            player.setdefault("lh_t", list(range(31)))
+        self.match["teamfights"] = [
+            {
+                "start": 900,
+                "end": 930,
+                "players": [
+                    {
+                        "ability_uses": {"legion_commander_duel": 1},
+                        "item_uses": {"blink": 1},
+                        "killed": {"npc_dota_hero_juggernaut": 1},
+                        "deaths": 0,
+                        "damage": 2500,
+                        "gold_delta": 600,
+                    },
+                    *[{} for _ in range(9)],
+                ],
+            }
+        ]
+        report, _ = generate_report(
+            self.match,
+            HEROES,
+            ITEMS,
+            zh_names={
+                "items": {"blink": "闪烁匕首", "blade_mail": "刃甲", "tango": "树之祭祀"},
+                "abilities": {"legion_commander_duel": "决斗"},
+            },
+            focus_account_id=1000,
+            focus_player_slot=0,
+        )
+        self.assertIn("## 英雄定位与胜利责任证据（Max）", report)
+        self.assertIn("核心位倾向（C 位检查表适用）", report)
+        self.assertIn("10:00 10 补刀", report)
+        self.assertIn("最高效窗口", report)
+        self.assertIn("## 团战切入与技能释放证据（Max）", report)
+        self.assertIn("技能：决斗 ×1", report)
+        self.assertIn("道具：闪烁匕首 ×1", report)
+
+    def test_coach_prompt_requires_more_than_death_analysis(self):
+        self.assertIn("不能只对被击杀作出反应", AI_COACH_INSTRUCTIONS)
+        self.assertIn("团战切入", AI_COACH_INSTRUCTIONS)
+        self.assertIn("目标转化", AI_COACH_INSTRUCTIONS)
+        self.assertIn("至少指出一项可复制的优点", AI_COACH_INSTRUCTIONS)
+
     def test_chatgpt_bundle_contains_prompt_report_and_raw_json(self):
         report, _ = generate_report(self.match, HEROES, ITEMS)
         bundle = make_chatgpt_bundle(
@@ -426,6 +654,11 @@ class ReviewTests(unittest.TestCase):
             script_dir = Path(temp_dir)
             settings_path = script_dir / "settings.json"
             save_account_id(settings_path, 123456789)
+            save_telegram_settings(
+                script_dir / "telegram_settings.json",
+                bot_token="123456789:abcdefghijklmnopqrstuvwxyz_ABCDE",
+                chat_id=987654321,
+            )
             args = argparse.Namespace(
                 day_offset=1,
                 parse_timeout=1,
