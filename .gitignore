@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.cache/
+reports/
+daily_logs/
+
+# Local account and delivery configuration. Never commit these files.
+settings.json
+telegram_settings.json
+daily_state.json
+
+# Local release archives and editor/system files.
+*.zip
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
