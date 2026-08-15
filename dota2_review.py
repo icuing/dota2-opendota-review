@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import re
 import shutil
 import socket
@@ -28,7 +29,7 @@ except ImportError:  # OpenWrt's minimal Python build may omit this desktop-only
 
 API_BASE = "https://api.opendota.com/api"
 TELEGRAM_API_BASE = "https://api.telegram.org"
-APP_VERSION = "1.3.9"
+APP_VERSION = "1.6.1"
 USER_AGENT = f"dota2-match-review/{APP_VERSION}"
 CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 STEAM_ID64_BASE = 76561197960265728
@@ -36,6 +37,39 @@ MAX_ACCOUNT_ID = 2**32 - 1
 PARSE_POLL_INTERVAL_SECONDS = 10 * 60
 PARSE_WAIT_TIMEOUT_SECONDS = 60 * 60
 DEFAULT_RETENTION_DAYS = 30
+OPENAI_API_URL = "https://api.openai.com/v1/responses"
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+SERVERCHAN_API_BASE = "https://sctapi.ftqq.com"
+AI_PROVIDER_DEFAULTS = {
+    "openai": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
+    "deepseek": {"model": "deepseek-v4-pro", "reasoning_effort": "max"},
+}
+AI_COACH_INSTRUCTIONS = """你是一名专业、严格但不羞辱玩家的 Dota 2 中文教练。你的目标不是复述 KDA 或只追究死亡，而是帮助玩家建立可重复的对线、发育、出装、地图、团战切入和技能释放决策。主要依据输入中的 OpenDota 数据和“教练证据包”分析，不得声称看过录像，也不得把推测写成事实。
+
+写作与分析要求：
+1. 全文使用简体中文；英雄、装备和技能使用输入提供的官方中文名，不要自行换回英文名。
+2. 开头先完成“英雄与位置职责判定”：结合英雄技能特质、分路、队内打钱排名、补刀、出装和参团数据判断本局更像一至五号位中的哪类职责；给出判断依据和置信度。可以使用稳定的英雄机制常识，但不得编造当前版本的具体数值或输入中不存在的改动。
+3. 必须同时分析做得好的和拖累胜率的部分，不能只对被击杀作出反应。按“对线期 → 第一波关键装备/强势期 → 中期地图与刷钱路线 → 关键团战/决胜团 → 控图与目标转化”还原因果链，不要机械罗列全部数据。
+4. 若判断为核心位（玩家口中的 C 位），必须逐项回答：
+   - 打钱：10/15/20/25/30 分钟补刀与经济节奏，低效五分钟窗口是合理参团、死亡断档还是路线问题；
+   - 强势期：关键装备到手时间、技能冷却和队友条件是否支持开团或逼塔；
+   - 团战切入：应该先露头、二次切入还是反手，优先目标与主要敌方反制是什么；
+   - 技能释放：结合逐次团战技能使用证据，分析施法次数、留技能/交技能时机和技能目标选择可能造成的影响；
+   - 转化：赢团或获得安全空间后，是否把资源转成防御塔、Roshan、兵线或下一件装备。
+   若判断为辅助或功能位，则改为分析视野、开团/反手、保护核心、资源占用、支援和关键技能覆盖率。
+5. 只挑 2–4 个真正决定胜负、且下一局可改变的问题深入讲透。评价每个决策时解释：当时双方强度、关键装备或技能、这一步想达到什么目的、为什么成功或失败。数据不足时写“可能”，并列出需要录像确认的观察点。
+6. 对每个“关键死亡教练证据”额外分析：
+   - 死亡前 10–20 秒应观察哪些信号；
+   - 对方当时的强势来源和可能的技能链；
+   - 本人当时可选的站位、撤退路线、技能/道具应对；
+   - 下一局遇到相同信号时的一句明确行动口令。
+   若数据只记录了击杀者或团战内技能，而不能证明最后一击技能，必须写“可能的技能链”，不能断言具体技能完成击杀。
+7. 出装分析不能只说早或晚；要结合敌方威胁、英雄职责和已观察到的强势窗口，说明某件装备应提前/延后，以及它要解决的具体问题。
+8. 好局要提炼可复制的习惯；差局要找出最早可以止损的节点。每局至少指出一项可复制的优点。把个人决策、团队条件和数据无法判断的部分分开。不要把输赢全部归因于队友，也不要用终局 KDA 倒推所有过程。
+9. 语气可以直接、有画面感并偶尔轻松，但不要模仿任何具体创作者的口头禅。优先给具体时间点和实战判断，不要为了完整而堆砌表格。
+10. 结尾给出三条下一局训练任务。每条必须包含“触发信号 → 当场动作 → 赛后可检查指标”，并按优先级排序；至少一条与该英雄/位置的核心胜利条件直接相关。
+
+建议正文结构：一句话总评、英雄与职责、可复制的优点、最影响胜率的 2–4 个问题、分阶段复盘、关键团战与死亡、出装方案、三条训练任务。引用具体时间、经济差、装备和技能作为证据。事实与推测在相关段落内就地标注，不要单独写一大段泛泛的免责声明。"""
 
 GAME_MODES = {
     1: "All Pick",
@@ -73,6 +107,30 @@ class MatchNotFound(OpenDotaError):
 
 class TelegramError(RuntimeError):
     """A user-facing Telegram Bot API error."""
+
+
+class AIReviewError(RuntimeError):
+    """A user-facing AI provider error that never exposes the API key."""
+
+
+class ServerChanError(RuntimeError):
+    """A user-facing ServerChan error that never exposes the SendKey."""
+
+
+def resource_dir() -> Path:
+    """Return the directory containing bundled read-only resources."""
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    return Path(frozen_root) if frozen_root else Path(__file__).resolve().parent
+
+
+def application_dir() -> Path:
+    """Return the writable application directory for settings and reports."""
+    override = str(os.environ.get("DOTA2_REVIEW_HOME") or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 def request_json(
@@ -152,6 +210,28 @@ def load_constant(resource: str, cache_dir: Path) -> Any:
     return data
 
 
+def load_zh_names(script_dir: Path) -> dict[str, dict[str, str]]:
+    """Load the bundled official Simplified Chinese gameplay-name map."""
+    path = script_dir / "dota_zh_names.json"
+    if not path.is_file():
+        path = resource_dir() / "dota_zh_names.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"items": {}, "abilities": {}}
+    if not isinstance(payload, dict):
+        return {"items": {}, "abilities": {}}
+    result: dict[str, dict[str, str]] = {}
+    for group in ("items", "abilities"):
+        values = payload.get(group)
+        result[group] = (
+            {str(key): str(value) for key, value in values.items() if value}
+            if isinstance(values, dict)
+            else {}
+        )
+    return result
+
+
 def validate_match_id(raw: str) -> int:
     value = raw.strip()
     if not value.isdigit() or not 1 <= len(value) <= 20:
@@ -200,6 +280,394 @@ def save_settings(settings_path: Path, data: dict[str, Any]) -> None:
     settings_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def validate_ai_settings(data: dict[str, Any]) -> dict[str, str]:
+    provider = str(data.get("provider") or "").strip().lower()
+    if provider not in AI_PROVIDER_DEFAULTS:
+        raise ValueError("AI 服务商必须是 openai 或 deepseek。")
+    api_key = str(data.get("api_key") or "").strip()
+    if len(api_key) < 10 or any(char.isspace() for char in api_key):
+        raise ValueError("API Key 格式不正确，请完整复制后重试。")
+    defaults = AI_PROVIDER_DEFAULTS[provider]
+    model = str(data.get("model") or defaults["model"]).strip()
+    if not model or len(model) > 100 or any(char.isspace() for char in model):
+        raise ValueError("模型名称格式不正确。")
+    effort = str(data.get("reasoning_effort") or defaults["reasoning_effort"]).strip().lower()
+    allowed = (
+        {"none", "low", "medium", "high", "xhigh", "max"}
+        if provider == "openai"
+        else {"high", "max"}
+    )
+    if effort not in allowed:
+        raise ValueError(f"{provider} 的推理强度可选：{', '.join(sorted(allowed))}。")
+    return {
+        "provider": provider,
+        "api_key": api_key,
+        "model": model,
+        "reasoning_effort": effort,
+    }
+
+
+def load_ai_settings(settings_path: Path) -> dict[str, str] | None:
+    try:
+        return validate_ai_settings(load_settings(settings_path))
+    except ValueError:
+        return None
+
+
+def save_ai_settings(settings_path: Path, data: dict[str, Any]) -> None:
+    config = validate_ai_settings(data)
+    settings_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    try:
+        settings_path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def ai_provider_name(config: dict[str, Any]) -> str:
+    return "OpenAI" if config.get("provider") == "openai" else "DeepSeek"
+
+
+def _ai_error_detail(exc: HTTPError, api_key: str) -> str:
+    detail = ""
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(error, dict):
+            detail = str(error.get("message") or "")
+        elif error:
+            detail = str(error)
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        pass
+    if api_key:
+        detail = detail.replace(api_key, "[已隐藏]")
+    return detail[:500]
+
+
+def _request_ai_json(
+    url: str,
+    payload: dict[str, Any],
+    api_key: str,
+    *,
+    timeout: int = 300,
+    retries: int = 2,
+) -> Any:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(
+                request, timeout=timeout, context=ssl.create_default_context()
+            ) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = _ai_error_detail(exc, api_key)
+            if exc.code in {429, 500, 502, 503, 504} and attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
+            suffix = f"：{detail}" if detail else ""
+            raise AIReviewError(f"AI 接口请求失败（HTTP {exc.code}）{suffix}") from exc
+        except (URLError, TimeoutError, socket.timeout) as exc:
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
+            reason = str(getattr(exc, "reason", exc)).replace(api_key, "[已隐藏]")
+            raise AIReviewError(f"无法连接 AI 接口：{reason}") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AIReviewError("AI 接口返回了无法解析的数据。") from exc
+    raise AIReviewError("AI 接口请求失败，请稍后重试。")
+
+
+def print_ai_usage(response: Any, provider: str) -> None:
+    if not isinstance(response, dict) or not isinstance(response.get("usage"), dict):
+        return
+    usage = response["usage"]
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
+    details = usage.get("output_tokens_details") or usage.get("completion_tokens_details")
+    reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    parts = []
+    if input_tokens is not None:
+        parts.append(f"输入 {input_tokens} tokens")
+    if output_tokens is not None:
+        parts.append(f"输出 {output_tokens} tokens")
+    if reasoning_tokens is not None:
+        parts.append(f"其中推理 {reasoning_tokens} tokens")
+    if parts:
+        print(f"AI 用量（{provider}）：" + "，".join(parts) + "。")
+
+
+def request_ai_review(
+    config: dict[str, Any],
+    source_text: str,
+    *,
+    test_mode: bool = False,
+) -> str:
+    clean = validate_ai_settings(config)
+    max_tokens = 512 if test_mode else 8000
+    if clean["provider"] == "openai":
+        payload = {
+            "model": clean["model"],
+            "store": False,
+            "reasoning": {"effort": clean["reasoning_effort"]},
+            "max_output_tokens": max_tokens,
+            "instructions": (
+                "只回复：API连接成功" if test_mode else AI_COACH_INSTRUCTIONS
+            ),
+            "input": source_text,
+        }
+        response = _request_ai_json(OPENAI_API_URL, payload, clean["api_key"])
+        if not test_mode:
+            print_ai_usage(response, "OpenAI")
+        texts: list[str] = []
+        for item in response.get("output", []) if isinstance(response, dict) else []:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if isinstance(content, dict) and content.get("type") == "output_text":
+                    texts.append(str(content.get("text") or ""))
+        result = "\n".join(text for text in texts if text).strip()
+    else:
+        messages = [
+            {
+                "role": "system",
+                "content": "只回复：API连接成功" if test_mode else AI_COACH_INSTRUCTIONS,
+            },
+            {"role": "user", "content": source_text},
+        ]
+        payload = {
+            "model": clean["model"],
+            "messages": messages,
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": clean["reasoning_effort"],
+            "max_tokens": (
+                512
+                if test_mode
+                else 64000 if clean["reasoning_effort"] == "max" else 32000
+            ),
+            "stream": False,
+        }
+        response = _request_ai_json(DEEPSEEK_API_URL, payload, clean["api_key"])
+        if not test_mode:
+            print_ai_usage(response, "DeepSeek")
+        try:
+            content = response["choices"][0]["message"]["content"]
+            result = content.strip() if isinstance(content, str) else ""
+        except (KeyError, IndexError, TypeError):
+            result = ""
+    if not result:
+        raise AIReviewError(
+            "AI 接口没有返回最终正文；为保证质量，本次没有降级到非思考模式。"
+            "请稍后重试。"
+        )
+    return result
+
+
+def setup_ai(ai_settings_path: Path) -> int:
+    print("请选择用于深度复盘的 API 服务商：")
+    print("  1. OpenAI（GPT）")
+    print("  2. DeepSeek")
+    try:
+        choice = input("请输入 1 或 2：").strip()
+        provider = {"1": "openai", "2": "deepseek"}.get(choice)
+        if provider is None:
+            raise ValueError("请选择 1 或 2。")
+        defaults = AI_PROVIDER_DEFAULTS[provider]
+        api_key = getpass.getpass("请输入 API Key（输入不会显示）：").strip()
+        model = input(f"模型名称（直接回车使用 {defaults['model']}）：").strip()
+        effort_options = (
+            "none/low/medium/high/xhigh/max" if provider == "openai" else "high/max"
+        )
+        effort = input(
+            f"推理强度 {effort_options}（直接回车使用 {defaults['reasoning_effort']}）："
+        ).strip()
+        config = validate_ai_settings(
+            {
+                "provider": provider,
+                "api_key": api_key,
+                "model": model or defaults["model"],
+                "reasoning_effort": effort or defaults["reasoning_effort"],
+            }
+        )
+        print("正在测试 API 连接；测试成功后才会保存设置 …")
+        result = request_ai_review(config, "连接测试", test_mode=True)
+        save_ai_settings(ai_settings_path, config)
+        print(
+            f"AI 设置成功：{ai_provider_name(config)} / {config['model']}。"
+            f"接口返回：{result}"
+        )
+        return 0
+    except ValueError as exc:
+        print(f"输入错误：{exc}", file=sys.stderr)
+        return 2
+    except AIReviewError as exc:
+        print(f"AI 设置测试失败，原设置未改动：{exc}", file=sys.stderr)
+        return 8
+    except OSError as exc:
+        print(f"AI 设置保存失败：{exc}", file=sys.stderr)
+        return 5
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消 AI 设置。", file=sys.stderr)
+        return 130
+
+
+def validate_serverchan_sendkey(raw: str) -> str:
+    sendkey = raw.strip()
+    if not re.fullmatch(r"SCT[A-Za-z0-9_-]{8,}", sendkey):
+        raise ValueError("SendKey 格式不正确，应当以 SCT 开头。")
+    return sendkey
+
+
+def load_serverchan_settings(settings_path: Path) -> dict[str, str] | None:
+    settings = load_settings(settings_path)
+    try:
+        return {"sendkey": validate_serverchan_sendkey(str(settings.get("sendkey") or ""))}
+    except ValueError:
+        return None
+
+
+def save_serverchan_settings(settings_path: Path, sendkey: str) -> None:
+    settings_path.write_text(
+        json.dumps(
+            {"sendkey": validate_serverchan_sendkey(sendkey)},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    try:
+        settings_path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def serverchan_send(
+    config: dict[str, Any],
+    title: str,
+    content: str,
+    *,
+    timeout: int = 60,
+) -> None:
+    sendkey = validate_serverchan_sendkey(str(config.get("sendkey") or ""))
+    safe_title = " ".join(title.splitlines()).strip()[:100] or "Dota 2 复盘"
+    url = f"{SERVERCHAN_API_BASE}/{sendkey}.send"
+    body = urlencode({"title": safe_title, "desp": content}).encode("utf-8")
+    request = Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with urlopen(
+            request, timeout=timeout, context=ssl.create_default_context()
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ServerChanError(f"Server酱请求失败（HTTP {exc.code}）。") from exc
+    except (URLError, TimeoutError, socket.timeout) as exc:
+        reason = str(getattr(exc, "reason", exc)).replace(sendkey, "[已隐藏]")
+        raise ServerChanError(f"无法连接 Server酱：{reason}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ServerChanError("Server酱返回了无法解析的数据。") from exc
+    try:
+        success_code = int(payload.get("code", -1)) if isinstance(payload, dict) else -1
+    except (TypeError, ValueError):
+        success_code = -1
+    if success_code != 0:
+        message = str(payload.get("message") or payload.get("data") or "未知错误") if isinstance(payload, dict) else "未知错误"
+        message = message.replace(sendkey, "[已隐藏]")[:300]
+        raise ServerChanError(f"Server酱推送失败：{message}")
+
+
+def notify_serverchan_if_configured(
+    settings_path: Path, title: str, content: str
+) -> bool:
+    config = load_serverchan_settings(settings_path)
+    if config is None:
+        return False
+    try:
+        serverchan_send(config, title, content)
+        print("个人微信推送已发送。")
+        return True
+    except ServerChanError as exc:
+        print(f"个人微信推送失败：{exc}", file=sys.stderr)
+        return False
+
+
+def notify_wechat_primary_with_telegram_fallback(
+    *,
+    serverchan_settings_path: Path,
+    telegram_settings_path: Path,
+    wechat_enabled: bool,
+    telegram_enabled: bool,
+    wechat_title: str,
+    wechat_content: str,
+    telegram_text: str,
+    telegram_documents: list[tuple[Path, str]] | None = None,
+) -> bool:
+    """Send to WeChat first, using Telegram only when WeChat cannot confirm delivery."""
+    if wechat_enabled:
+        if notify_serverchan_if_configured(
+            serverchan_settings_path, wechat_title, wechat_content
+        ):
+            return True
+        if telegram_enabled:
+            print("个人微信未确认发送成功，正在改用 Telegram 兜底 …", file=sys.stderr)
+    if telegram_enabled:
+        return notify_telegram_if_configured(
+            telegram_settings_path,
+            telegram_text,
+            documents=telegram_documents,
+        )
+    return False
+
+
+def setup_serverchan(settings_path: Path) -> int:
+    print("请从 https://sct.ftqq.com 的 SendKey 页面复制 SCT 开头的 SendKey。")
+    try:
+        sendkey = validate_serverchan_sendkey(
+            getpass.getpass("请输入 SendKey（输入不会显示）：")
+        )
+        config = {"sendkey": sendkey}
+        print("正在发送个人微信测试消息；成功后才会保存设置 …")
+        serverchan_send(
+            config,
+            "Dota 2 复盘工具连接测试",
+            "✅ 个人微信推送连接成功。以后 AI 最终复盘会自动发送到这里。",
+        )
+        save_serverchan_settings(settings_path, sendkey)
+        print("个人微信推送设置成功，SendKey 已隐藏保存。")
+        return 0
+    except ValueError as exc:
+        print(f"输入错误：{exc}", file=sys.stderr)
+        return 2
+    except ServerChanError as exc:
+        print(f"个人微信设置测试失败，原设置未改动：{exc}", file=sys.stderr)
+        return 9
+    except OSError as exc:
+        print(f"个人微信设置保存失败：{exc}", file=sys.stderr)
+        return 5
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消个人微信设置。", file=sys.stderr)
+        return 130
 
 
 def load_saved_account_id(settings_path: Path) -> int | None:
@@ -938,7 +1406,7 @@ def format_gold_delta(value: int) -> str:
 
 def load_chinese_hero_names() -> dict[int, str]:
     """Load the bundled Simplified Chinese hero names, falling back safely."""
-    names_path = Path(__file__).resolve().parent / "hero_names_zh.json"
+    names_path = resource_dir() / "hero_names_zh.json"
     try:
         raw = json.loads(names_path.read_text(encoding="utf-8"))
         return {
@@ -975,7 +1443,9 @@ def make_hero_maps(heroes: Any) -> tuple[dict[int, str], dict[str, str]]:
     return by_id, by_internal
 
 
-def make_item_maps(items: Any) -> tuple[dict[int, str], dict[str, dict[str, Any]]]:
+def make_item_maps(
+    items: Any, zh_item_names: dict[str, str] | None = None
+) -> tuple[dict[int, str], dict[str, dict[str, Any]]]:
     by_id: dict[int, str] = {}
     by_key: dict[str, dict[str, Any]] = {}
     if not isinstance(items, dict):
@@ -983,7 +1453,11 @@ def make_item_maps(items: Any) -> tuple[dict[int, str], dict[str, dict[str, Any]
     for key, item in items.items():
         if not isinstance(item, dict):
             continue
-        display = item.get("dname") or str(key).replace("_", " ").title()
+        localized = (zh_item_names or {}).get(str(key))
+        if zh_item_names:
+            display = localized if localized and re.search(r"[\u4e00-\u9fff]", localized) else "未收录物品"
+        else:
+            display = item.get("dname") or str(key).replace("_", " ").title()
         normalized = dict(item)
         normalized["_display"] = display
         by_key[str(key)] = normalized
@@ -1016,6 +1490,16 @@ def purchase_name(key: Any, item_by_key: dict[str, dict[str, Any]]) -> str:
     normalized = str(key or "").removeprefix("item_")
     item = item_by_key.get(normalized, {})
     return str(item.get("_display") or normalized.replace("_", " ").title() or "未知物品")
+
+
+def ability_name(key: Any, zh_ability_names: dict[str, str]) -> str:
+    normalized = str(key or "").removeprefix("item_")
+    if normalized in {"", "null"}:
+        return "普通攻击或未标记伤害"
+    localized = zh_ability_names.get(normalized)
+    if localized and re.search(r"[\u4e00-\u9fff]", localized):
+        return localized
+    return "未收录技能"
 
 
 def killer_name(raw: Any, hero_by_internal: dict[str, str]) -> str:
@@ -1170,18 +1654,456 @@ def markdown_table(headers: list[str], rows: list[list[Any]]) -> list[str]:
     return output
 
 
+def _timeline_value(player: dict[str, Any], field: str, second: int) -> int | None:
+    values = player.get(field)
+    if not isinstance(values, list) or not values:
+        return None
+    minute = max(0, second // 60)
+    try:
+        return int(values[min(minute, len(values) - 1)])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _fight_containing(match: dict[str, Any], second: int) -> dict[str, Any] | None:
+    candidates = []
+    for fight in match.get("teamfights") or []:
+        if not isinstance(fight, dict):
+            continue
+        try:
+            start = int(fight.get("start") or 0)
+            end = int(fight.get("end") or start)
+        except (TypeError, ValueError):
+            continue
+        if start - 5 <= second <= end + 5:
+            candidates.append((end - start, fight))
+    return min(candidates, key=lambda row: row[0])[1] if candidates else None
+
+
+def _localized_skill_counts(
+    values: Any, zh_ability_names: dict[str, str], *, limit: int = 8
+) -> str:
+    if not isinstance(values, dict):
+        return "无可用记录"
+    rows: list[tuple[str, int]] = []
+    for key, raw_count in values.items():
+        try:
+            count = int(raw_count or 0)
+        except (TypeError, ValueError):
+            count = 0
+        name = ability_name(key, zh_ability_names)
+        if count > 0 and name != "未收录技能":
+            rows.append((name, count))
+    rows.sort(key=lambda row: (-row[1], row[0]))
+    return "、".join(f"{name} ×{count}" for name, count in rows[:limit]) or "无可用记录"
+
+
+def _localized_damage_amounts(
+    values: Any, zh_ability_names: dict[str, str], *, limit: int = 8
+) -> str:
+    if not isinstance(values, dict):
+        return "无可用记录"
+    rows: list[tuple[str, int]] = []
+    for key, raw_damage in values.items():
+        try:
+            damage = int(raw_damage or 0)
+        except (TypeError, ValueError):
+            damage = 0
+        name = ability_name(key, zh_ability_names)
+        if damage > 0 and name != "未收录技能":
+            rows.append((name, damage))
+    rows.sort(key=lambda row: (-row[1], row[0]))
+    return "、".join(f"{name} {damage:,} 伤害" for name, damage in rows[:limit]) or "无可用记录"
+
+
+def _team_rank(
+    focus_player: dict[str, Any], teammates: list[dict[str, Any]], field: str
+) -> int:
+    ranked = sorted(teammates, key=lambda row: numeric_value(row.get(field)), reverse=True)
+    try:
+        return ranked.index(focus_player) + 1
+    except ValueError:
+        return len(ranked)
+
+
+def _benchmark_percentile(player: dict[str, Any], field: str) -> str:
+    benchmark = player.get("benchmarks")
+    metric = benchmark.get(field) if isinstance(benchmark, dict) else None
+    try:
+        percentile = float(metric.get("pct")) if isinstance(metric, dict) else None
+    except (TypeError, ValueError):
+        percentile = None
+    return f"同英雄样本第 {percentile * 100:.0f} 百分位" if percentile is not None else "无同英雄基准"
+
+
+def _timeline_checkpoints(player: dict[str, Any]) -> str:
+    gold_t = player.get("gold_t")
+    lh_t = player.get("lh_t")
+    if not isinstance(gold_t, list) or not isinstance(lh_t, list):
+        return "无分钟级经济/补刀数据"
+    last_minute = min(len(gold_t), len(lh_t)) - 1
+    if last_minute < 0:
+        return "无分钟级经济/补刀数据"
+    checkpoints = [minute for minute in (5, 10, 15, 20, 25, 30, 35, 40, 50, 60) if minute <= last_minute]
+    if last_minute not in checkpoints:
+        checkpoints.append(last_minute)
+    rows = []
+    for minute in checkpoints:
+        try:
+            rows.append(f"{minute}:00 {int(lh_t[minute])} 补刀/{int(gold_t[minute]):,} 经济")
+        except (TypeError, ValueError, IndexError):
+            continue
+    return "；".join(rows) or "无分钟级经济/补刀数据"
+
+
+def _farm_windows(player: dict[str, Any], *, window_minutes: int = 5) -> str:
+    gold_t = player.get("gold_t")
+    lh_t = player.get("lh_t")
+    if not isinstance(gold_t, list) or not isinstance(lh_t, list):
+        return "无可用记录"
+    length = min(len(gold_t), len(lh_t))
+    windows: list[tuple[int, int, int, int]] = []
+    for start in range(0, max(0, length - window_minutes), window_minutes):
+        end = min(length - 1, start + window_minutes)
+        if end <= start:
+            continue
+        try:
+            gold_gain = int(gold_t[end]) - int(gold_t[start])
+            lh_gain = int(lh_t[end]) - int(lh_t[start])
+        except (TypeError, ValueError, IndexError):
+            continue
+        windows.append((start, end, gold_gain, lh_gain))
+    if not windows:
+        return "无可用记录"
+    strongest = max(windows, key=lambda row: (row[2], row[3]))
+    candidates = [row for row in windows if row[0] >= 10] or windows
+    weakest = min(candidates, key=lambda row: (row[2], row[3]))
+
+    def describe(row: tuple[int, int, int, int]) -> str:
+        start, end, gold_gain, lh_gain = row
+        return f"{start}:00–{end}:00 +{gold_gain:,} 经济/+{lh_gain} 补刀"
+
+    return f"最高效窗口 {describe(strongest)}；10 分钟后最低效窗口 {describe(weakest)}"
+
+
+def _localized_item_uses(
+    values: Any, item_by_key: dict[str, dict[str, Any]], *, limit: int = 8
+) -> str:
+    if not isinstance(values, dict):
+        return "无可用记录"
+    rows: list[tuple[str, int]] = []
+    for key, raw_count in values.items():
+        try:
+            count = int(raw_count or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            rows.append((purchase_name(key, item_by_key), count))
+    rows.sort(key=lambda row: (-row[1], row[0]))
+    return "、".join(f"{name} ×{count}" for name, count in rows[:limit]) or "无可用记录"
+
+
+def _focus_teamfight_rows(
+    match: dict[str, Any],
+    focus_player: dict[str, Any],
+    players: list[dict[str, Any]],
+    zh_ability_names: dict[str, str],
+    item_by_key: dict[str, dict[str, Any]],
+) -> list[str]:
+    try:
+        player_index = players.index(focus_player)
+    except ValueError:
+        return []
+    candidates: list[tuple[int, int, list[str]]] = []
+    for fight in match.get("teamfights") or []:
+        fight_players = fight.get("players") if isinstance(fight, dict) else None
+        if not isinstance(fight_players, list) or player_index >= len(fight_players):
+            continue
+        evidence = fight_players[player_index]
+        if not isinstance(evidence, dict):
+            continue
+        ability_uses = evidence.get("ability_uses")
+        item_uses = evidence.get("item_uses")
+        damage = int(numeric_value(evidence.get("damage")))
+        deaths = int(numeric_value(evidence.get("deaths")))
+        kills = sum(int(numeric_value(value)) for value in (evidence.get("killed") or {}).values())
+        gold_delta = int(numeric_value(evidence.get("gold_delta")))
+        if not (ability_uses or item_uses or damage or deaths or kills):
+            continue
+        start = int(numeric_value(fight.get("start")))
+        end = int(numeric_value(fight.get("end")))
+        details = [
+            f"{format_game_time(start)}–{format_game_time(end)}",
+            f"伤害 {damage:,}",
+            f"击杀/死亡 {kills}/{deaths}",
+            f"经济变化 {gold_delta:+,}",
+            "技能：" + _localized_skill_counts(ability_uses, zh_ability_names, limit=10),
+            "道具：" + _localized_item_uses(item_uses, item_by_key, limit=8),
+        ]
+        importance = deaths * 5000 + kills * 4000 + damage + abs(gold_delta)
+        candidates.append((importance, start, details))
+    selected = sorted(candidates, reverse=True)[:8]
+    selected.sort(key=lambda row: row[1])
+    return ["- " + "；".join(row[2]) + "。" for row in selected]
+
+
+def build_role_coach_evidence(
+    match: dict[str, Any],
+    focus_player: dict[str, Any] | None,
+    players: list[dict[str, Any]],
+    hero_by_id: dict[int, str],
+    item_by_id: dict[int, str],
+    item_by_key: dict[str, dict[str, Any]],
+    zh_ability_names: dict[str, str],
+) -> list[str]:
+    if focus_player is None:
+        return []
+    teammates = [player for player in players if is_radiant(player) == is_radiant(focus_player)]
+    team_kills = sum(int(numeric_value(player.get("kills"))) for player in teammates)
+    team_net_worth = sum(int(numeric_value(player.get("net_worth"))) for player in teammates)
+    team_hero_damage = sum(int(numeric_value(player.get("hero_damage"))) for player in teammates)
+    team_tower_damage = sum(int(numeric_value(player.get("tower_damage"))) for player in teammates)
+    farm_rank = _team_rank(focus_player, teammates, "gold_per_min")
+    lh_rank = _team_rank(focus_player, teammates, "last_hits")
+    damage_rank = _team_rank(focus_player, teammates, "hero_damage")
+    tower_rank = _team_rank(focus_player, teammates, "tower_damage")
+    lane = LANE_ROLES.get(focus_player.get("lane_role"), "未知分路")
+    core_score = int(farm_rank <= 3) + int(lh_rank <= 3) + int(focus_player.get("lane_role") == 2)
+    role_hint = "核心位倾向（C 位检查表适用）" if core_score >= 2 else "辅助/功能位倾向"
+    kills = int(numeric_value(focus_player.get("kills")))
+    assists = int(numeric_value(focus_player.get("assists")))
+    participation = (kills + assists) / max(1, team_kills)
+    net_share = numeric_value(focus_player.get("net_worth")) / max(1, team_net_worth)
+    damage_share = numeric_value(focus_player.get("hero_damage")) / max(1, team_hero_damage)
+    tower_share = numeric_value(focus_player.get("tower_damage")) / max(1, team_tower_damage)
+    lane_efficiency = numeric_value(
+        focus_player.get("lane_efficiency_pct", focus_player.get("lane_efficiency"))
+    )
+    if lane_efficiency and lane_efficiency <= 1:
+        lane_efficiency *= 100
+    purchases = notable_purchases(
+        focus_player, item_by_id, item_by_key, include_all=False
+    )
+    purchase_text = "；".join(
+        f"{format_game_time(row['time'])} {row['name']}" for row in purchases
+    ) or "无可用购买记录"
+    lines = [
+        "## 英雄定位与胜利责任证据（Max）",
+        "",
+        f"- **英雄/分路**：{hero_name(focus_player.get('hero_id'), hero_by_id)}，{lane}；程序初判为 **{role_hint}**。这是基于本局资源分配的证据，不等同于选人界面中的固定位置。",
+        f"- **队内资源排序**：GPM 第 {farm_rank}/5，补刀第 {lh_rank}/5，英雄伤害第 {damage_rank}/5，建筑伤害第 {tower_rank}/5。",
+        f"- **资源与转化占比**：终局团队经济占比 {net_share:.1%}，英雄伤害占比 {damage_share:.1%}，建筑伤害占比 {tower_share:.1%}，击杀参与率约 {participation:.1%}。",
+        f"- **对线与同英雄基准**：对线效率 {lane_efficiency:.1f}%（若 OpenDota 有记录）；GPM {_benchmark_percentile(focus_player, 'gold_per_min')}，补刀 {_benchmark_percentile(focus_player, 'last_hits_per_min')}，英雄伤害 {_benchmark_percentile(focus_player, 'hero_damage_per_min')}。",
+        f"- **打钱检查点**：{_timeline_checkpoints(focus_player)}。",
+        f"- **五分钟窗口**：{_farm_windows(focus_player)}。低效窗口必须结合参团、死亡和地图目标判断，不能直接等同于刷钱路线错误。",
+        f"- **关键装备时间**：{purchase_text}。",
+        f"- **战斗与地图指标**：参团率 {numeric_value(focus_player.get('teamfight_participation')):.1%}，总阵亡等待 {format_duration(focus_player.get('life_state_dead'))}，买活 {int(numeric_value(focus_player.get('buyback_count')))} 次，TP 使用 {int(numeric_value((focus_player.get('item_uses') or {}).get('tpscroll')))} 次，堆野 {int(numeric_value(focus_player.get('camps_stacked')))} 次，插眼 {int(numeric_value(focus_player.get('obs_placed')))}/真眼 {int(numeric_value(focus_player.get('sen_placed')))}。",
+        "- **分析任务**：先判断英雄本局职责和稳定的英雄特质，再分别评价对线、打钱路线、强势期、团战切入、技能释放、出装与目标转化；至少指出一项可复制的优点和一项最早可止损的问题。",
+        "",
+        "## 团战切入与技能释放证据（Max）",
+        "",
+        "> 下列记录能证明团战时间窗内使用过哪些技能/道具及结果，但不能证明精确施法顺序、站位和目标；这些必须写成待录像确认的推断。",
+        "",
+    ]
+    fight_rows = _focus_teamfight_rows(
+        match, focus_player, players, zh_ability_names, item_by_key
+    )
+    lines += fight_rows or ["- 无逐次团战记录。"]
+    lines += [""]
+    return lines
+
+
+def _important_focus_deaths(
+    deaths: list[dict[str, Any]],
+    focus_player: dict[str, Any],
+    curve: list[tuple[int, int, int, int]],
+) -> list[dict[str, Any]]:
+    own = [row for row in deaths if row.get("victim_player") is focus_player]
+    if not own:
+        return []
+    early = [row for row in own if int(row.get("time") or 0) <= 10 * 60]
+    chosen = list(early[:3])
+    swing_second: int | None = None
+    if len(curve) > 1:
+        _swing_from, swing_to = max(
+            zip(curve, curve[1:]), key=lambda pair: abs(pair[1][3] - pair[0][3])
+        )
+        swing_second = int(swing_to[0]) * 60
+        decisive = min(
+            own, key=lambda row: abs(int(row.get("time") or 0) - swing_second)
+        )
+        if decisive not in chosen:
+            chosen.append(decisive)
+
+    curve_by_minute = {row[0]: row[3] for row in curve}
+
+    def importance(row: dict[str, Any]) -> tuple[int, int, int]:
+        second = int(row.get("time") or 0)
+        cluster_size = sum(
+            1
+            for event in deaths
+            if event.get("side") == row.get("side")
+            and abs(int(event.get("time") or 0) - second) <= 45
+        )
+        minute = second // 60
+        local_swing = abs(
+            curve_by_minute.get(minute + 1, curve_by_minute.get(minute, 0))
+            - curve_by_minute.get(max(0, minute - 1), curve_by_minute.get(minute, 0))
+        )
+        swing_bonus = (
+            max(0, 180 - abs(second - swing_second)) if swing_second is not None else 0
+        )
+        return cluster_size, local_swing, swing_bonus
+
+    remaining = [row for row in own if row not in chosen]
+    remaining.sort(key=importance, reverse=True)
+    for row in remaining:
+        if len(chosen) >= min(6, len(own)):
+            break
+        chosen.append(row)
+    if not chosen:
+        chosen.append(own[0])
+    chosen.sort(key=lambda row: int(row.get("time") or 0))
+    return chosen
+
+
+def build_key_death_evidence(
+    match: dict[str, Any],
+    deaths: list[dict[str, Any]],
+    focus_player: dict[str, Any] | None,
+    players: list[dict[str, Any]],
+    hero_by_id: dict[int, str],
+    internal_by_id: dict[int, str],
+    item_by_id: dict[int, str],
+    item_by_key: dict[str, dict[str, Any]],
+    zh_ability_names: dict[str, str],
+    curve: list[tuple[int, int, int, int]],
+) -> list[str]:
+    if focus_player is None:
+        return []
+    selected = _important_focus_deaths(deaths, focus_player, curve)
+    if not selected:
+        return []
+    lines = [
+        "## 关键死亡教练证据（Max）",
+        "",
+        "> 以下内容供 AI 深入分析。击杀者和时间来自死亡日志；“团战技能”只表示该团战内使用过，不能单独证明最后一击技能。",
+        "",
+    ]
+    for row in selected:
+        second = int(row.get("time") or 0)
+        killer_player = row.get("killer_player")
+        lines += [f"### {format_game_time(second)} · 被 {row.get('killer')} 击杀", ""]
+        if isinstance(killer_player, dict):
+            killer_gold = _timeline_value(killer_player, "gold_t", second)
+            killer_lh = _timeline_value(killer_player, "lh_t", second)
+            purchases = [
+                purchase
+                for purchase in notable_purchases(
+                    killer_player,
+                    item_by_id,
+                    item_by_key,
+                    include_all=False,
+                )
+                if int(purchase.get("time") or 0) <= second
+            ]
+            purchase_text = "、".join(
+                f"{format_game_time(item['time'])} {item['name']}" for item in purchases[-6:]
+            ) or "未记录关键成装"
+            strength_bits = []
+            if killer_gold is not None:
+                strength_bits.append(f"约 {killer_gold:,} 经济")
+            if killer_lh is not None:
+                strength_bits.append(f"{killer_lh} 正补")
+            lines += [
+                f"- **对方当时强度**：{'、'.join(strength_bits) or '无分钟级经济数据'}；此前关键装备：{purchase_text}。",
+                f"- **击杀者终局数据（仅作强度背景）**："
+                f"{killer_player.get('kills', 0)}/{killer_player.get('deaths', 0)}/{killer_player.get('assists', 0)}，"
+                f"GPM {killer_player.get('gold_per_min', '-')}，XPM {killer_player.get('xp_per_min', '-')}。",
+            ]
+            try:
+                killer_index = players.index(killer_player)
+            except ValueError:
+                killer_index = -1
+            fight = _fight_containing(match, second)
+            fight_players = fight.get("players") if isinstance(fight, dict) else None
+            if (
+                killer_index >= 0
+                and isinstance(fight_players, list)
+                and killer_index < len(fight_players)
+                and isinstance(fight_players[killer_index], dict)
+            ):
+                lines.append(
+                    "- **该团战击杀者使用的技能**："
+                    + _localized_skill_counts(
+                        fight_players[killer_index].get("ability_uses"),
+                        zh_ability_names,
+                    )
+                    + "。"
+                )
+            killer_internal = internal_by_id.get(int(killer_player.get("hero_id") or 0), "")
+            prefix = killer_internal.removeprefix("npc_dota_hero_")
+            received = focus_player.get("damage_inflictor_received")
+            if prefix and isinstance(received, dict):
+                related = {
+                    key: value
+                    for key, value in received.items()
+                    if str(key).startswith(prefix + "_")
+                }
+                if related:
+                    lines.append(
+                        "- **本场该英雄对你造成过的已记录技能伤害**："
+                        + _localized_damage_amounts(related, zh_ability_names)
+                        + "。"
+                    )
+        nearby = [
+            event
+            for event in deaths
+            if event.get("side") == row.get("side")
+            and abs(int(event.get("time") or 0) - second) <= 45
+        ]
+        if len(nearby) >= 2:
+            lines.append(
+                "- **附近连续阵亡**："
+                + "；".join(
+                    f"{format_game_time(event.get('time'))} {event.get('victim')}"
+                    for event in nearby
+                )
+                + "。"
+            )
+        if curve:
+            minute = min(max(0, second // 60), curve[-1][0])
+            curve_by_minute = {row[0]: row[3] for row in curve}
+            before_minute = max(0, minute - 1)
+            before = curve_by_minute.get(before_minute)
+            after_minute = min(curve[-1][0], minute + 1)
+            after = curve_by_minute.get(after_minute)
+            if before is not None and after is not None:
+                lines.append(
+                    f"- **经济背景**：{before_minute}:00 {format_gold_delta(before)} → "
+                    f"{after_minute}:00 {format_gold_delta(after)}。"
+                )
+        lines += [
+            "- **分析任务**：解释死亡前应观察的危险信号、可能的技能链、可用的站位/撤退/道具应对，以及下次的行动口令。",
+            "",
+        ]
+    return lines
+
+
 def generate_report(
     match: dict[str, Any],
     heroes: Any,
     items: Any,
     *,
+    zh_names: dict[str, dict[str, str]] | None = None,
     include_all_purchases: bool = False,
     focus_account_id: int | None = None,
     focus_player_slot: int | None = None,
 ) -> tuple[str, list[str]]:
     """Return Markdown and the list of missing parsed sections."""
     hero_by_id, hero_by_internal = make_hero_maps(heroes)
-    item_by_id, item_by_key = make_item_maps(items)
+    zh_names = zh_names or {"items": {}, "abilities": {}}
+    item_by_id, item_by_key = make_item_maps(items, zh_names.get("items"))
     match_id = int(match.get("match_id") or 0)
     players = match.get("players") or []
     parsed, missing = parsed_sections(match)
@@ -1319,6 +2241,34 @@ def generate_report(
             "",
         ]
 
+    if focus_player is not None:
+        zh_ability_names = zh_names.get("abilities", {})
+        lines += [
+            "## 我的技能与伤害证据",
+            "",
+            "- **技能使用次数**："
+            + _localized_skill_counts(focus_player.get("ability_uses"), zh_ability_names, limit=16)
+            + "。",
+            "- **主要输出来源**："
+            + _localized_damage_amounts(focus_player.get("damage_inflictor"), zh_ability_names, limit=12)
+            + "。",
+            "- **主要承伤来源**："
+            + _localized_damage_amounts(
+                focus_player.get("damage_inflictor_received"), zh_ability_names, limit=12
+            )
+            + "。",
+            "",
+        ]
+        lines += build_role_coach_evidence(
+            match,
+            focus_player,
+            players,
+            hero_by_id,
+            item_by_id,
+            item_by_key,
+            zh_ability_names,
+        )
+
     lines += ["## 死亡时间线", ""]
     deaths: list[dict[str, Any]] = []
     hero_values: Iterable[Any] = heroes.values() if isinstance(heroes, dict) else heroes or []
@@ -1361,6 +2311,8 @@ def generate_report(
                             f"{hero_name(killer_player.get('hero_id'), hero_by_id)}"
                             f"（{player_label(killer_player)}）"
                         ),
+                        "victim_player": victim_player,
+                        "killer_player": killer_player,
                     }
                 )
     else:
@@ -1375,6 +2327,8 @@ def generate_report(
                         "side": "天辉" if is_radiant(player) else "夜魇",
                         "victim": f"{hero_name(player.get('hero_id'), hero_by_id)}（{player_label(player)}）",
                         "killer": killer_name(death.get("killername"), hero_by_internal),
+                        "victim_player": player,
+                        "killer_player": player_by_internal.get(str(death.get("killername") or "")),
                     }
                 )
     deaths.sort(key=lambda row: int(row.get("time") or 0))
@@ -1386,8 +2340,20 @@ def generate_report(
     else:
         lines.append("没有取得死亡日志；若本局确有击杀，请先 Request Parse。")
 
+    lines += [""] + build_key_death_evidence(
+        match,
+        deaths,
+        focus_player,
+        players,
+        hero_by_id,
+        internal_by_id,
+        item_by_id,
+        item_by_key,
+        zh_names.get("abilities", {}),
+        curve,
+    )
+
     lines += [
-        "",
         "## 数据说明",
         "",
         "- 本报告只读取 OpenDota 公开 API，不登录 Steam、完美世界电竞或其他账号。",
@@ -1491,6 +2457,8 @@ def run_daily_review(
     settings_path: Path,
 ) -> int:
     telegram_settings_path = script_dir / "telegram_settings.json"
+    ai_settings_path = script_dir / "ai_settings.json"
+    serverchan_settings_path = script_dir / "serverchan_settings.json"
     daily_state_path = script_dir / "daily_state.json"
     if not getattr(args, "no_cleanup", False):
         cleanup_result = cleanup_old_downloads(
@@ -1507,23 +2475,35 @@ def run_daily_review(
         return 2
 
     target_date = datetime.now().astimezone().date() - timedelta(days=args.day_offset)
-    if (
+    telegram_enabled = (
         not getattr(args, "no_telegram", False)
         and load_telegram_settings(telegram_settings_path) is not None
-        and daily_was_sent(daily_state_path, target_date)
+    )
+    wechat_enabled = (
+        not getattr(args, "no_wechat", False)
+        and load_serverchan_settings(serverchan_settings_path) is not None
+    )
+    if (telegram_enabled or wechat_enabled) and daily_was_sent(
+        daily_state_path, target_date
     ):
-        print(f"{target_date.isoformat()} 的复盘已经成功发送到 Telegram，本次不重复生成或发送。")
+        print(f"{target_date.isoformat()} 的复盘已经成功发送，本次不重复生成或发送。")
         return 0
     print(f"正在读取 {target_date.isoformat()} 的全部比赛 …")
     try:
         matches = fetch_matches_for_local_date(account_id, target_date)
         if not matches:
             print(f"{target_date.isoformat()} 没有查询到公开比赛，无需生成每日复盘。")
-            if not getattr(args, "no_telegram", False):
-                notify_telegram_if_configured(
-                    telegram_settings_path,
-                    f"🎮 {target_date.isoformat()} 没有查询到公开 Dota 2 比赛，今日不生成复盘。",
-                )
+            notify_wechat_primary_with_telegram_fallback(
+                serverchan_settings_path=serverchan_settings_path,
+                telegram_settings_path=telegram_settings_path,
+                wechat_enabled=wechat_enabled,
+                telegram_enabled=telegram_enabled,
+                wechat_title=f"{target_date.isoformat()} Dota 2 每日复盘",
+                wechat_content="今天没有查询到公开比赛，无需生成复盘。",
+                telegram_text=(
+                    f"🎮 {target_date.isoformat()} 没有查询到公开 Dota 2 比赛，今日不生成复盘。"
+                ),
+            )
             return 0
         print(f"当天共找到 {len(matches)} 场，正在补充个人经济和伤害数据 …")
         matches = enrich_match_summaries(account_id, matches)
@@ -1531,11 +2511,15 @@ def run_daily_review(
         hero_by_id, _ = make_hero_maps(heroes)
     except OpenDotaError as exc:
         print(f"每日比赛查询失败：{exc}", file=sys.stderr)
-        if not getattr(args, "no_telegram", False):
-            notify_telegram_if_configured(
-                telegram_settings_path,
-                f"⚠️ {target_date.isoformat()} Dota 2 每日比赛查询失败：{exc}",
-            )
+        notify_wechat_primary_with_telegram_fallback(
+            serverchan_settings_path=serverchan_settings_path,
+            telegram_settings_path=telegram_settings_path,
+            wechat_enabled=wechat_enabled,
+            telegram_enabled=telegram_enabled,
+            wechat_title=f"{target_date.isoformat()} Dota 2 复盘失败",
+            wechat_content=f"每日比赛查询失败：{exc}",
+            telegram_text=f"⚠️ {target_date.isoformat()} Dota 2 每日比赛查询失败：{exc}",
+        )
         return 4
 
     selected = select_daily_representatives(matches)
@@ -1603,12 +2587,18 @@ def run_daily_review(
                 )
         except (OSError, ValueError) as exc:
             print(f"不完整临时文件清理失败：{exc}", file=sys.stderr)
-        if not getattr(args, "no_telegram", False):
-            notify_telegram_if_configured(
-                telegram_settings_path,
+        notify_wechat_primary_with_telegram_fallback(
+            serverchan_settings_path=serverchan_settings_path,
+            telegram_settings_path=telegram_settings_path,
+            wechat_enabled=wechat_enabled,
+            telegram_enabled=telegram_enabled,
+            wechat_title=f"{target_date.isoformat()} Dota 2 复盘等待解析",
+            wechat_content="代表局尚未全部解析完整，本次没有发送复盘；下次运行会重新检查。",
+            telegram_text=(
                 f"⏳ {target_date.isoformat()} 的代表局尚未全部解析完整，"
-                "本次没有发送复盘文件；下次运行会重新检查。",
-            )
+                "本次没有发送复盘文件；下次运行会重新检查。"
+            ),
+        )
         return 7
 
     summary_lines = [
@@ -1631,7 +2621,14 @@ def run_daily_review(
     summary_path = output_dir / f"daily_{target_date.isoformat()}_summary.md"
     combined_path = output_dir / f"daily_{target_date.isoformat()}_chatgpt_bundle.md"
     combined_lines = list(summary_lines)
+    ai_input_lines = list(summary_lines)
     for label, match, bundle_path in completed:
+        report_paths = sorted(bundle_path.parent.glob("*_复盘摘要.md"))
+        report_text = (
+            report_paths[0].read_text(encoding="utf-8-sig")
+            if report_paths
+            else bundle_path.read_text(encoding="utf-8-sig")
+        )
         combined_lines += [
             "",
             "---",
@@ -1639,6 +2636,14 @@ def run_daily_review(
             f"# {label} · Match {match.get('match_id')}",
             "",
             bundle_path.read_text(encoding="utf-8-sig"),
+        ]
+        ai_input_lines += [
+            "",
+            "---",
+            "",
+            f"# {label} · Match {match.get('match_id')}",
+            "",
+            report_text,
         ]
     try:
         summary_path.write_text("\n".join(summary_lines), encoding="utf-8-sig", newline="\n")
@@ -1649,20 +2654,64 @@ def run_daily_review(
 
     print(f"\n每日复盘摘要已生成：{summary_path}")
     print(f"每日双局 ChatGPT 数据包已生成：{combined_path}")
-    sent_to_telegram = False
-    if not getattr(args, "no_telegram", False):
-        message_lines = [
-            f"🎮 {target_date.isoformat()} Dota 2 每日复盘",
-            f"当天比赛：{len(matches)} 场",
-            "",
-        ]
-        message_lines.extend(
-            telegram_plain_text(
-                match_selection_summary(label, match, hero_by_id).removeprefix("- ")
+    skip_ai = bool(getattr(args, "no_ai_review", False))
+    ai_config = None if skip_ai else load_ai_settings(ai_settings_path)
+    ai_review_path: Path | None = None
+    if ai_config is not None:
+        provider = ai_provider_name(ai_config)
+        print(f"正在调用 {provider} / {ai_config['model']} 生成最终教练复盘 …")
+        try:
+            ai_review = request_ai_review(ai_config, "\n".join(ai_input_lines))
+            ai_review_path = output_dir / f"daily_{target_date.isoformat()}_AI最终复盘.md"
+            ai_review_path.write_text(
+                f"# {target_date.isoformat()} · AI 最终教练复盘\n\n"
+                f"> 服务商：{provider}｜模型：{ai_config['model']}\n\n"
+                f"{ai_review.rstrip()}\n",
+                encoding="utf-8-sig",
+                newline="\n",
             )
-            for label, match, _ in completed
+            print(f"AI 最终复盘已生成：{ai_review_path}")
+        except (AIReviewError, OSError) as exc:
+            print(f"AI 深度复盘失败：{exc}。本次不会发送残缺结果。", file=sys.stderr)
+            notify_wechat_primary_with_telegram_fallback(
+                serverchan_settings_path=serverchan_settings_path,
+                telegram_settings_path=telegram_settings_path,
+                wechat_enabled=wechat_enabled,
+                telegram_enabled=telegram_enabled,
+                wechat_title=f"{target_date.isoformat()} Dota 2 AI 复盘失败",
+                wechat_content=(
+                    f"基础数据已准备好，但 AI 深度复盘失败：{exc}\n\n"
+                    "本次未发送最终复盘，下次运行会重试。"
+                ),
+                telegram_text=(
+                    f"⚠️ {target_date.isoformat()} 的基础数据已准备好，但 AI 深度复盘失败：{exc}。"
+                    "本次未发送复盘文件，下次运行会重试。"
+                ),
+            )
+            return 8
+    elif not skip_ai:
+        print("尚未配置 AI API，本次保持旧版流程；运行 --setup-ai 后可自动生成最终复盘。")
+    message_lines = [
+        f"🎮 {target_date.isoformat()} Dota 2 每日复盘",
+        f"当天比赛：{len(matches)} 场",
+        "",
+    ]
+    message_lines.extend(
+        telegram_plain_text(
+            match_selection_summary(label, match, hero_by_id).removeprefix("- ")
         )
-        documents: list[tuple[Path, str]] = []
+        for label, match, _ in completed
+    )
+    delivery_configured = wechat_enabled or telegram_enabled
+    documents: list[tuple[Path, str]] = []
+    if telegram_enabled:
+        if ai_review_path is not None and ai_config is not None:
+            documents.append(
+                (
+                    ai_review_path,
+                    f"AI 最终教练复盘｜{ai_provider_name(ai_config)} / {ai_config['model']}",
+                )
+            )
         for label, match, bundle_path in completed:
             report_paths = sorted(bundle_path.parent.glob("*_复盘摘要.md"))
             if report_paths:
@@ -1672,18 +2721,35 @@ def run_daily_review(
                         telegram_match_caption(target_date, label, match, hero_by_id),
                     )
                 )
-        documents.append((combined_path, "待 GPT 分析的完整数据包｜这不是 GPT 最终复盘结果"))
-        sent = notify_telegram_if_configured(
-            telegram_settings_path,
-            "\n".join(message_lines),
-            documents=documents,
-        )
-        if sent:
-            try:
-                mark_daily_sent(daily_state_path, target_date, completed)
-                sent_to_telegram = True
-            except (OSError, ValueError) as exc:
-                print(f"发送成功，但已发送状态保存失败，将保留本地文件：{exc}", file=sys.stderr)
+        if ai_review_path is None:
+            documents.append((combined_path, "待 AI 分析的完整数据包｜这不是 AI 最终复盘结果"))
+    wechat_ready = wechat_enabled
+    wechat_content = "\n".join(summary_lines)
+    if wechat_enabled and ai_review_path is not None:
+        try:
+            wechat_content = ai_review_path.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            print(f"个人微信复盘文件读取失败：{exc}", file=sys.stderr)
+            wechat_ready = False
+            if telegram_enabled:
+                print("正在改用 Telegram 兜底 …", file=sys.stderr)
+    delivery_succeeded = notify_wechat_primary_with_telegram_fallback(
+        serverchan_settings_path=serverchan_settings_path,
+        telegram_settings_path=telegram_settings_path,
+        wechat_enabled=wechat_ready,
+        telegram_enabled=telegram_enabled,
+        wechat_title=f"{target_date.isoformat()} Dota 2 AI 最终复盘",
+        wechat_content=wechat_content,
+        telegram_text="\n".join(message_lines),
+        telegram_documents=documents,
+    )
+    delivery_complete = False
+    if delivery_configured and delivery_succeeded:
+        try:
+            mark_daily_sent(daily_state_path, target_date, completed)
+            delivery_complete = True
+        except (OSError, ValueError) as exc:
+            print(f"发送成功，但已发送状态保存失败，将保留本地文件：{exc}", file=sys.stderr)
     if not args.no_open_project:
         project_url = load_saved_project_url(settings_path)
         open_chatgpt_handoff(combined_path, project_url)
@@ -1691,13 +2757,13 @@ def run_daily_review(
             print("已打开“Dota2复盘”项目和数据包位置，请把每日数据包拖入项目聊天并发送。")
         else:
             print("已打开数据包位置；先在普通模式保存项目链接，即可同时自动打开项目。")
-    if sent_to_telegram:
+    if delivery_complete:
         try:
             removed, reclaimed = delete_generated_tree(
                 output_dir, script_dir / "reports" / "daily"
             )
             print(
-                f"Telegram 已确认接收，已删除本次本地临时文件 {removed} 个，"
+                f"主推送或备用渠道已确认接收，已删除本次本地临时文件 {removed} 个，"
                 f"释放 {format_byte_size(reclaimed)}。"
             )
         except (OSError, ValueError) as exc:
@@ -1762,6 +2828,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="删除本机保存的 Telegram Bot Token 和接收人后退出",
     )
     parser.add_argument(
+        "--setup-ai",
+        action="store_true",
+        help="交互式选择 OpenAI 或 DeepSeek，测试 API 后安全保存设置",
+    )
+    parser.add_argument(
+        "--test-ai",
+        action="store_true",
+        help="测试已保存的 AI API 与模型后退出",
+    )
+    parser.add_argument(
+        "--show-ai",
+        action="store_true",
+        help="显示当前 AI 服务商、模型和推理强度（不会显示 API Key）",
+    )
+    parser.add_argument(
+        "--forget-ai",
+        action="store_true",
+        help="删除本机保存的 AI API 设置后退出",
+    )
+    parser.add_argument(
+        "--no-ai-review",
+        action="store_true",
+        help="本次不调用 AI API，只生成并按旧流程发送基础复盘",
+    )
+    parser.add_argument(
+        "--setup-wechat",
+        action="store_true",
+        help="交互式连接 Server酱，把最终复盘推送到个人微信",
+    )
+    parser.add_argument(
+        "--test-wechat",
+        action="store_true",
+        help="向已连接的个人微信发送一条测试消息后退出",
+    )
+    parser.add_argument(
+        "--show-wechat",
+        action="store_true",
+        help="显示个人微信推送状态（不会显示 SendKey）",
+    )
+    parser.add_argument(
+        "--forget-wechat",
+        action="store_true",
+        help="删除本机保存的 Server酱 SendKey 后退出",
+    )
+    parser.add_argument(
+        "--no-wechat",
+        action="store_true",
+        help="本次每日任务不发送个人微信通知或最终复盘",
+    )
+    parser.add_argument(
         "-o", "--output", type=Path, help="自定义复盘摘要路径；默认按日期、英雄、KDA创建独立文件夹"
     )
     parser.add_argument(
@@ -1799,9 +2915,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="生成复盘数据包后不自动打开 ChatGPT 项目页面和文件位置",
     )
     parser.add_argument(
+        "--send",
         "--send-telegram",
+        dest="send_telegram",
         action="store_true",
-        help="单场模式生成完成后把自动复盘摘要和 GPT 数据包发送到 Telegram",
+        help="单场模式生成完成后推送；个人微信优先，未确认成功时由 Telegram 兜底",
     )
     parser.add_argument(
         "--no-telegram",
@@ -1845,9 +2963,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    script_dir = Path(__file__).resolve().parent
+    script_dir = application_dir()
     settings_path = script_dir / "settings.json"
     telegram_settings_path = script_dir / "telegram_settings.json"
+    ai_settings_path = script_dir / "ai_settings.json"
+    serverchan_settings_path = script_dir / "serverchan_settings.json"
 
     if not 1 <= args.parse_timeout <= 60:
         print("输入错误：解析等待时间应为 1 到 60 分钟。", file=sys.stderr)
@@ -1868,7 +2988,7 @@ def run(argv: list[str] | None = None) -> int:
                 f"已删除全部本地生成数据：{result['removed_files']} 个文件，"
                 f"释放 {format_byte_size(result['reclaimed_bytes'])}。"
             )
-            print("Steam、Telegram 设置和防重复发送记录均已保留。")
+            print("Steam、AI、Telegram、个人微信设置和防重复发送记录均已保留。")
             return 0
         except OSError as exc:
             print(f"清理全部生成数据失败：{exc}", file=sys.stderr)
@@ -1884,6 +3004,88 @@ def run(argv: list[str] | None = None) -> int:
         )
         print_cleanup_result(result)
         return 5 if result.get("errors") else 0
+
+    if args.setup_ai:
+        return setup_ai(ai_settings_path)
+
+    if args.show_ai:
+        config = load_ai_settings(ai_settings_path)
+        if config is None:
+            print("尚未设置 AI API，请先运行 --setup-ai。", file=sys.stderr)
+            return 2
+        print(
+            f"当前 AI：{ai_provider_name(config)} / {config['model']} / "
+            f"推理强度 {config['reasoning_effort']}"
+        )
+        print("API Key 已隐藏。")
+        return 0
+
+    if args.test_ai:
+        config = load_ai_settings(ai_settings_path)
+        if config is None:
+            print("尚未设置 AI API，请先运行 --setup-ai。", file=sys.stderr)
+            return 2
+        try:
+            result = request_ai_review(config, "连接测试", test_mode=True)
+            print(
+                f"AI 测试成功：{ai_provider_name(config)} / {config['model']}。"
+                f"接口返回：{result}"
+            )
+            return 0
+        except AIReviewError as exc:
+            print(f"AI 测试失败：{exc}", file=sys.stderr)
+            return 8
+
+    if args.forget_ai:
+        try:
+            if ai_settings_path.exists():
+                ai_settings_path.unlink()
+                print("已删除 AI API 设置。")
+            else:
+                print("当前没有保存 AI API 设置。")
+            return 0
+        except OSError as exc:
+            print(f"删除 AI 设置失败：{exc}", file=sys.stderr)
+            return 5
+
+    if args.setup_wechat:
+        return setup_serverchan(serverchan_settings_path)
+
+    if args.show_wechat:
+        if load_serverchan_settings(serverchan_settings_path) is None:
+            print("尚未设置个人微信推送，请先运行 --setup-wechat。", file=sys.stderr)
+            return 2
+        print("个人微信推送已连接，SendKey 已隐藏。")
+        return 0
+
+    if args.test_wechat:
+        config = load_serverchan_settings(serverchan_settings_path)
+        if config is None:
+            print("尚未设置个人微信推送，请先运行 --setup-wechat。", file=sys.stderr)
+            return 2
+        try:
+            serverchan_send(
+                config,
+                "Dota 2 复盘工具测试",
+                "✅ 个人微信测试成功。",
+            )
+            print("个人微信测试消息已发送。")
+            return 0
+        except ServerChanError as exc:
+            print(f"个人微信测试失败：{exc}", file=sys.stderr)
+            return 9
+
+    if args.forget_wechat:
+        try:
+            if serverchan_settings_path.exists():
+                serverchan_settings_path.unlink()
+                print("已删除个人微信推送设置。")
+            else:
+                print("当前没有保存个人微信推送设置。")
+            return 0
+        except OSError as exc:
+            print(f"删除个人微信设置失败：{exc}", file=sys.stderr)
+            return 5
 
     if args.setup_telegram:
         return setup_telegram(telegram_settings_path)
@@ -2105,6 +3307,7 @@ def run(argv: list[str] | None = None) -> int:
         print("正在读取英雄与物品名称 …")
         heroes = load_constant("heroes", cache_dir)
         items = load_constant("items", cache_dir)
+        zh_names = load_zh_names(script_dir)
         artifact_stem = build_match_artifact_stem(
             match,
             heroes,
@@ -2123,6 +3326,7 @@ def run(argv: list[str] | None = None) -> int:
             match,
             heroes,
             items,
+            zh_names=zh_names,
             include_all_purchases=args.all_purchases,
             focus_account_id=focus_account_id,
             focus_player_slot=focus_player_slot,
@@ -2154,30 +3358,82 @@ def run(argv: list[str] | None = None) -> int:
         elif parse_attempted and parse_completed:
             print("OpenDota 解析已完成，数据包使用的是最新解析结果。")
 
-        sent_to_telegram = False
-        if args.send_telegram and not args.no_telegram:
-            config = load_telegram_settings(telegram_settings_path)
-            if config is None:
+        delivery_confirmed = False
+        ai_review_path: Path | None = None
+        ai_config = None if args.no_ai_review else load_ai_settings(ai_settings_path)
+        if args.send_telegram and ai_config is not None:
+            provider = ai_provider_name(ai_config)
+            print(f"正在调用 {provider} / {ai_config['model']} 生成最终教练复盘 …")
+            try:
+                ai_review = request_ai_review(ai_config, report)
+                ai_review_path = artifact_dir / f"{artifact_stem}_AI最终复盘.md"
+                ai_review_path.write_text(
+                    f"# Match {match_id} · AI 最终教练复盘\n\n"
+                    f"> 服务商：{provider}｜模型：{ai_config['model']}\n\n"
+                    f"{ai_review.rstrip()}\n",
+                    encoding="utf-8-sig",
+                    newline="\n",
+                )
+                print(f"AI 最终复盘已生成：{ai_review_path}")
+            except (AIReviewError, OSError) as exc:
+                print(f"AI 深度复盘失败：{exc}。本次不会发送残缺结果。", file=sys.stderr)
+                return 8
+        if args.send_telegram:
+            wechat_enabled = (
+                not args.no_wechat
+                and load_serverchan_settings(serverchan_settings_path) is not None
+            )
+            telegram_enabled = (
+                not args.no_telegram
+                and load_telegram_settings(telegram_settings_path) is not None
+            )
+            if not wechat_enabled and not telegram_enabled:
                 print(
-                    "尚未设置 Telegram；请先运行 python3 dota2_review.py --setup-telegram。",
+                    "尚未设置可用推送渠道；请先运行 --setup-wechat，或设置 Telegram 作为兜底。",
                     file=sys.stderr,
                 )
                 return 2
-            try:
-                telegram_send_message(
-                    config,
-                    f"🎮 Dota 2 单场复盘已生成\nMatch ID：{match_id}\n文件将依次发送。",
+
+            wechat_content = report
+            if ai_review_path is not None:
+                try:
+                    wechat_content = ai_review_path.read_text(encoding="utf-8-sig")
+                except OSError as exc:
+                    print(f"个人微信复盘文件读取失败：{exc}", file=sys.stderr)
+                    wechat_enabled = False
+
+            telegram_documents: list[tuple[Path, str]] = []
+            if ai_review_path is not None and ai_config is not None:
+                telegram_documents.append(
+                    (
+                        ai_review_path,
+                        f"Match {match_id} · AI 最终教练复盘 · "
+                        f"{ai_provider_name(ai_config)} / {ai_config['model']}",
+                    )
                 )
-                telegram_send_document(config, output_path, caption=f"Match {match_id} · 自动复盘摘要")
-                telegram_send_document(
-                    config,
-                    bundle_path,
-                    caption=f"Match {match_id} · 待 GPT 分析的完整数据包（不是 GPT 最终复盘）",
+            telegram_documents.append(
+                (output_path, f"Match {match_id} · 自动复盘摘要")
+            )
+            if ai_review_path is None:
+                telegram_documents.append(
+                    (
+                        bundle_path,
+                        f"Match {match_id} · 待 AI 分析的完整数据包（不是 AI 最终复盘）",
+                    )
                 )
-                print("Telegram 复盘文件已发送。")
-                sent_to_telegram = True
-            except TelegramError as exc:
-                print(f"Telegram 推送失败：{exc}", file=sys.stderr)
+
+            delivery_confirmed = notify_wechat_primary_with_telegram_fallback(
+                serverchan_settings_path=serverchan_settings_path,
+                telegram_settings_path=telegram_settings_path,
+                wechat_enabled=wechat_enabled,
+                telegram_enabled=telegram_enabled,
+                wechat_title=f"Match {match_id} · Dota 2 AI 最终复盘",
+                wechat_content=wechat_content,
+                telegram_text=(
+                    f"🎮 Dota 2 单场复盘已生成\nMatch ID：{match_id}\n文件将依次发送。"
+                ),
+                telegram_documents=telegram_documents,
+            )
 
         if not args.no_open_project:
             project_url = load_saved_project_url(settings_path)
@@ -2200,9 +3456,11 @@ def run(argv: list[str] | None = None) -> int:
                 print("项目页面和数据包位置已打开，请把复盘数据包拖进项目聊天并发送。")
             else:
                 print("数据包位置已打开；设置项目链接后可同时自动打开项目页面。")
-        if sent_to_telegram:
+        if delivery_confirmed:
             removed, reclaimed = delete_generated_files(
-                (output_path, raw_path, bundle_path)
+                path
+                for path in (output_path, raw_path, bundle_path, ai_review_path)
+                if path is not None
             )
             try:
                 if artifact_dir.is_dir() and not any(artifact_dir.iterdir()):
@@ -2210,7 +3468,7 @@ def run(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
             print(
-                f"Telegram 已确认接收，已删除本地文件 {removed} 个，"
+                f"主推送或备用渠道已确认接收，已删除本地文件 {removed} 个，"
                 f"释放 {format_byte_size(reclaimed)}。"
             )
         return 0

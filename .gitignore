@@ -3,11 +3,16 @@ __pycache__/
 .cache/
 reports/
 daily_logs/
+build/
+dist/
 
 # Local account and delivery configuration. Never commit these files.
 settings.json
 telegram_settings.json
+ai_settings.json
+serverchan_settings.json
 daily_state.json
+schedule_settings.json
 
 # Local release archives and editor/system files.
 *.zip
