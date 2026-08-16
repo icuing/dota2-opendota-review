@@ -29,7 +29,7 @@ except ImportError:  # OpenWrt's minimal Python build may omit this desktop-only
 
 API_BASE = "https://api.opendota.com/api"
 TELEGRAM_API_BASE = "https://api.telegram.org"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 USER_AGENT = f"dota2-match-review/{APP_VERSION}"
 CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 STEAM_ID64_BASE = 76561197960265728
@@ -69,9 +69,15 @@ AI_COACH_INSTRUCTIONS = """你是一名专业、严格但不羞辱玩家的 Dota
 7. 出装分析不能只说早或晚；要结合敌方威胁、英雄职责和已观察到的强势窗口，说明某件装备应提前/延后，以及它要解决的具体问题。
 8. 好局要提炼可复制的习惯；差局要找出最早可以止损的节点。每局至少指出一项可复制的优点。把个人决策、团队条件和数据无法判断的部分分开。不要把输赢全部归因于队友，也不要用终局 KDA 倒推所有过程。
 9. 语气可以直接、有画面感并偶尔轻松，但不要模仿任何具体创作者的口头禅。优先给具体时间点和实战判断，不要为了完整而堆砌表格。
-10. 结尾给出三条下一局训练任务。每条必须包含“触发信号 → 当场动作 → 赛后可检查指标”，并按优先级排序；至少一条与该英雄/位置的核心胜利条件直接相关。
+10. 必须增加“阵容与选人复盘”：
+   - 同时分析双方五人阵容的开团、反手、控制、爆发、持续输出、推塔、救人和前排是否完整，以及用户英雄在己方阵容中必须补足的功能；
+   - 若输入提供真实选择顺序，结合用户选人前已经出现的队友和敌人分析当时信息；若明确写着顺序缺失，绝不能从玩家槽位、赛后数据或最终阵容臆造顺序；
+   - 给用户本局选人一个 1–10 分的“选人评分”，分别解释对线适配、己方阵容补位、对敌方威胁和选择时机。评分只评价选人当时的合理性，不得因最终输赢或 KDA 倒推；顺序未知时将“选择时机”标为无法评分，且不因此扣分；
+   - 只有确有更优选择时才推荐 1–3 个替代英雄，使用简体中文名，并逐个说明它能补什么阵容缺口、对哪些已知敌方英雄更好、会付出什么代价。不要罗列泛用英雄池，也不要编造当前版本胜率或数值。
+11. 结尾给出三条下一局训练任务。每条必须包含“触发信号 → 当场动作 → 赛后可检查指标”，并按优先级排序；至少一条与该英雄/位置的核心胜利条件直接相关。
+12. 对同英雄多局专项复盘，额外给出“可直接照做的训练计划”：至少包含一项训练模式/自定义房机械练习、一项连续三局的对线或发育练习、一项团战切入/技能释放练习。每项必须写清准备方式、重复次数或时长、成功标准、失败后如何降低难度；目标应来自输入样本，不得给“多看录像、多练习”一类空话。
 
-建议正文结构：一句话总评、英雄与职责、可复制的优点、最影响胜率的 2–4 个问题、分阶段复盘、关键团战与死亡、出装方案、三条训练任务。引用具体时间、经济差、装备和技能作为证据。事实与推测在相关段落内就地标注，不要单独写一大段泛泛的免责声明。"""
+建议正文结构：一句话总评、英雄与职责、阵容与选人评分、可复制的优点、最影响胜率的 2–4 个问题、分阶段复盘、关键团战与死亡、出装方案、实操训练计划。引用具体时间、经济差、装备和技能作为证据。事实与推测在相关段落内就地标注，不要单独写一大段泛泛的免责声明。"""
 
 GAME_MODES = {
     1: "All Pick",
@@ -2147,6 +2153,217 @@ def build_key_death_evidence(
     return lines
 
 
+HERO_ROLE_LABELS = {
+    "Carry": "后期输出",
+    "Support": "辅助",
+    "Nuker": "爆发",
+    "Disabler": "控制",
+    "Jungler": "野区",
+    "Durable": "前排",
+    "Escape": "机动/逃生",
+    "Pusher": "推进",
+    "Initiator": "先手",
+}
+
+
+def make_hero_roles_map(heroes: Any) -> dict[int, list[str]]:
+    result: dict[int, list[str]] = {}
+    values: Iterable[Any] = heroes.values() if isinstance(heroes, dict) else heroes or []
+    for hero in values:
+        if not isinstance(hero, dict):
+            continue
+        try:
+            hero_id = int(hero.get("id"))
+        except (TypeError, ValueError):
+            continue
+        roles = hero.get("roles")
+        if isinstance(roles, list):
+            result[hero_id] = [str(role) for role in roles if role]
+    return result
+
+
+def _team_lineup(
+    match: dict[str, Any], radiant: bool, hero_by_id: dict[int, str]
+) -> list[str]:
+    return [
+        hero_name(player.get("hero_id"), hero_by_id)
+        for player in match.get("players") or []
+        if isinstance(player, dict) and is_radiant(player) == radiant
+    ]
+
+
+def _lineup_role_summary(
+    match: dict[str, Any],
+    radiant: bool,
+    hero_roles_by_id: dict[int, list[str]],
+) -> str:
+    counts: dict[str, int] = {}
+    for player in match.get("players") or []:
+        if not isinstance(player, dict) or is_radiant(player) != radiant:
+            continue
+        try:
+            hero_id = int(player.get("hero_id"))
+        except (TypeError, ValueError):
+            continue
+        for role in hero_roles_by_id.get(hero_id, []):
+            label = HERO_ROLE_LABELS.get(role)
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+    return "、".join(f"{label}×{count}" for label, count in counts.items()) or "缺少英雄职责标签"
+
+
+def extract_draft_context(
+    match: dict[str, Any],
+    focus_player: dict[str, Any] | None,
+    hero_by_id: dict[int, str],
+) -> dict[str, Any]:
+    raw_events = match.get("picks_bans")
+    events: list[dict[str, Any]] = []
+    if isinstance(raw_events, list):
+        for index, raw in enumerate(raw_events):
+            if not isinstance(raw, dict):
+                continue
+            try:
+                hero_id = int(raw.get("hero_id"))
+                team = int(raw.get("team"))
+            except (TypeError, ValueError):
+                continue
+            if team not in (0, 1):
+                continue
+            order_value = raw.get("order", raw.get("ord", index))
+            try:
+                order = int(order_value)
+            except (TypeError, ValueError):
+                order = index
+            events.append(
+                {
+                    "order": order,
+                    "team": team,
+                    "hero_id": hero_id,
+                    "hero": hero_name(hero_id, hero_by_id),
+                    "is_pick": bool(raw.get("is_pick")),
+                }
+            )
+    events.sort(key=lambda row: row["order"])
+    picks = [row for row in events if row["is_pick"]]
+    focus_event: dict[str, Any] | None = None
+    if focus_player is not None:
+        try:
+            focus_hero_id = int(focus_player.get("hero_id"))
+            focus_team = 0 if is_radiant(focus_player) else 1
+        except (TypeError, ValueError):
+            focus_hero_id = -1
+            focus_team = -1
+        focus_event = next(
+            (
+                row
+                for row in picks
+                if row["hero_id"] == focus_hero_id and row["team"] == focus_team
+            ),
+            None,
+        )
+    known_allies: list[str] = []
+    known_enemies: list[str] = []
+    if focus_event is not None:
+        for row in picks:
+            if row["order"] >= focus_event["order"]:
+                continue
+            target = known_allies if row["team"] == focus_event["team"] else known_enemies
+            target.append(row["hero"])
+    return {
+        "events": events,
+        "picks": picks,
+        "focus_event": focus_event,
+        "known_allies": known_allies,
+        "known_enemies": known_enemies,
+        "radiant": _team_lineup(match, True, hero_by_id),
+        "dire": _team_lineup(match, False, hero_by_id),
+    }
+
+
+def build_draft_evidence(
+    match: dict[str, Any],
+    focus_player: dict[str, Any] | None,
+    hero_by_id: dict[int, str],
+    hero_roles_by_id: dict[int, list[str]],
+) -> list[str]:
+    context = extract_draft_context(match, focus_player, hero_by_id)
+    lines = [
+        "## 双方阵容、选择顺序与选人分析输入",
+        "",
+        f"- **天辉最终阵容**：{'、'.join(context['radiant']) or '数据缺失'}。",
+        f"- **夜魇最终阵容**：{'、'.join(context['dire']) or '数据缺失'}。",
+        f"- **天辉功能标签**：{_lineup_role_summary(match, True, hero_roles_by_id)}。",
+        f"- **夜魇功能标签**：{_lineup_role_summary(match, False, hero_roles_by_id)}。",
+    ]
+    if context["events"]:
+        rows = [
+            [
+                row["order"] + 1,
+                "天辉" if row["team"] == 0 else "夜魇",
+                "选择" if row["is_pick"] else "禁用",
+                row["hero"],
+            ]
+            for row in context["events"]
+        ]
+        lines += ["", "### OpenDota 记录的选择/禁用顺序", ""]
+        lines += markdown_table(["记录顺序", "阵营", "动作", "英雄"], rows)
+        focus_event = context["focus_event"]
+        if focus_player is not None and focus_event is not None:
+            pick_number = context["picks"].index(focus_event) + 1
+            team_pick_number = (
+                len(
+                    [
+                        row
+                        for row in context["picks"]
+                        if row["team"] == focus_event["team"]
+                        and row["order"] <= focus_event["order"]
+                    ]
+                )
+            )
+            lines += [
+                "",
+                f"- **用户选人时点**：全场第 {pick_number} 个选择、己方第 {team_pick_number} 个选择；记录序号 {focus_event['order'] + 1}。",
+                f"- **此前已出现的队友**：{'、'.join(context['known_allies']) or '无'}。",
+                f"- **此前已出现的敌人**：{'、'.join(context['known_enemies']) or '无'}。",
+            ]
+        elif focus_player is not None:
+            lines += ["", "- **用户选人时点**：顺序数据存在，但未能可靠定位用户英雄；不得臆造。"]
+    else:
+        lines += [
+            "",
+            "> OpenDota 本局未提供可靠的 `picks_bans` 顺序。可分析最终阵容适配，但不得从玩家槽位、赛后数据或最终阵容反推选人先后。",
+        ]
+    if focus_player is not None:
+        lines += [
+            "",
+            f"- **本次用户英雄**：{hero_name(focus_player.get('hero_id'), hero_by_id)}。",
+            "- **选人评分任务**：AI 必须给 1–10 分，并拆解对线适配、己方阵容补位、敌方威胁和选择时机；不能用赛果/KDA 倒推。顺序未知时，选择时机标为无法评分且不扣分。",
+            "- **替代选择任务**：只有确有更优英雄时才给 1–3 个中文英雄名，分别说明补足的阵容功能、针对的已知敌人和选择代价。",
+        ]
+    return lines + [""]
+
+
+def compact_draft_context(
+    match: dict[str, Any],
+    focus_player: dict[str, Any],
+    hero_by_id: dict[int, str],
+) -> list[str]:
+    context = extract_draft_context(match, focus_player, hero_by_id)
+    focus_event = context["focus_event"]
+    lines = [
+        f"- 双方阵容：天辉 {'、'.join(context['radiant']) or '缺失'}｜夜魇 {'、'.join(context['dire']) or '缺失'}。"
+    ]
+    if focus_event is None:
+        lines.append("- 选择顺序：OpenDota 未提供或无法可靠定位；只评最终阵容适配，不推测先后。")
+    else:
+        pick_number = context["picks"].index(focus_event) + 1
+        lines.append(
+            f"- 用户选择顺序：全场第 {pick_number} 个选择；此前队友 {'、'.join(context['known_allies']) or '无'}；此前敌人 {'、'.join(context['known_enemies']) or '无'}。"
+        )
+    return lines
+
+
 def generate_report(
     match: dict[str, Any],
     heroes: Any,
@@ -2159,6 +2376,7 @@ def generate_report(
 ) -> tuple[str, list[str]]:
     """Return Markdown and the list of missing parsed sections."""
     hero_by_id, hero_by_internal = make_hero_maps(heroes)
+    hero_roles_by_id = make_hero_roles_map(heroes)
     zh_names = zh_names or {"items": {}, "abilities": {}}
     item_by_id, item_by_key = make_item_maps(items, zh_names.get("items"))
     match_id = int(match.get("match_id") or 0)
@@ -2220,6 +2438,13 @@ def generate_report(
                 format_number(focus_player.get("net_worth")),
             ]],
         )
+
+    lines += [""] + build_draft_evidence(
+        match,
+        focus_player,
+        hero_by_id,
+        hero_roles_by_id,
+    )
 
     for side_name, side_players in (
         ("天辉", [player for player in players if is_radiant(player)]),
@@ -2473,8 +2698,10 @@ def make_chatgpt_bundle(
         "- 对线期补刀、换血、死亡与资源获取；",
         "- 刷钱路线、关键装备时间和经济曲线；",
         "- 团战站位、技能与物品使用；",
+        "- 双方阵容功能、真实选择顺序（若有）以及我的英雄是否补足阵容；",
+        "- 给我的选人打 1–10 分；不能按赛果或 KDA 倒推，确有更优选择时再给 1–3 个替代英雄及取舍；",
         "- 导致胜负的关键决策；",
-        "- 给出三条下一局能直接执行的改进建议。",
+        "- 给出三条下一局能直接执行的改进建议，每条包含触发信号、当场动作和赛后指标。",
         "",
         f"我的 OpenDota account_id：`{focus_text}`。",
         "",
@@ -2626,7 +2853,9 @@ def build_hero_training_report(
     personal_samples: list[dict[str, Any]],
     benchmark_samples: list[dict[str, Any]],
     comparison_source: str,
+    hero_by_id: dict[int, str] | None = None,
 ) -> str:
+    hero_by_id = hero_by_id or load_chinese_hero_names()
     own = hero_sample_metrics(personal_samples)
     benchmark = hero_sample_metrics(benchmark_samples)
     source_names = {"self": "仅分析个人近期趋势", "pro": "职业比赛", "high_rank": "高分路人局"}
@@ -2674,6 +2903,11 @@ def build_hero_training_report(
             f"{int(numeric_value(player.get('assists')))}｜GPM {int(numeric_value(player.get('gold_per_min')))}｜"
             f"补刀 {int(numeric_value(player.get('last_hits')))}"
         )
+    lines += ["", "## 每局阵容与选人上下文", ""]
+    for index, sample in enumerate(personal_samples, start=1):
+        lines.append(f"### 个人 {index} · Match `{sample['match'].get('match_id')}`")
+        lines.extend(compact_draft_context(sample["match"], sample["player"], hero_by_id))
+        lines.append("")
     if benchmark_samples:
         lines += ["", "## 对比样本记录", ""]
         for index, sample in enumerate(benchmark_samples, start=1):
@@ -2685,6 +2919,7 @@ def build_hero_training_report(
                 f"{int(numeric_value(player.get('assists')))}｜GPM {int(numeric_value(player.get('gold_per_min')))}｜"
                 f"补刀 {int(numeric_value(player.get('last_hits')))}"
             )
+            lines.extend(compact_draft_context(match, player, hero_by_id))
         gaps = [
             ("GPM", own.get("gold_per_min", 0) - benchmark.get("gold_per_min", 0), "经济效率"),
             ("XPM", own.get("xp_per_min", 0) - benchmark.get("xp_per_min", 0), "经验效率"),
@@ -2700,7 +2935,11 @@ def build_hero_training_report(
         "",
         "## 给 AI 教练的任务",
         "",
-        "请结合每局原始数据判断趋势，不要只比较平均 KDA。重点分析英雄职责、打钱路线、关键装备时机、团战切入、技能释放、死亡原因和赢团后的地图目标。对职业/高分样本的差异要考虑比赛节奏与位置差异，不能机械照抄。最后给出三条可量化训练任务。",
+        "请结合每局原始数据判断趋势，不要只比较平均 KDA。重点分析英雄职责、打钱路线、关键装备时机、团战切入、技能释放、死亡原因和赢团后的地图目标。对职业/高分样本的差异要考虑比赛节奏与位置差异，不能机械照抄。",
+        "",
+        "必须逐局分析双方阵容，并给用户这次选择该英雄 1–10 分的选人评分。评分拆解为对线适配、己方功能补位、敌方威胁和选择时机；不得用最终输赢/KDA倒推。选择顺序缺失时明确标注且不扣分。只有确有更好选择时才推荐 1–3 个中文英雄名，并说明收益、针对目标和代价。",
+        "",
+        "最后输出一份可直接执行的同英雄训练计划，至少包括：①训练模式/自定义房机械练习；②连续三局的对线或发育练习；③团战切入/技能释放练习。每项写清准备方法、一次练多久或重复多少次、成功标准、失败后的降级练法，并附一张三局记录表。不得只写‘多练习、多看录像’。",
         "",
     ]
     return "\n".join(lines)
@@ -2750,6 +2989,7 @@ def run_hero_training(
             personal_samples,
             benchmark_samples,
             comparison_source,
+            hero_by_id,
         )
         timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M")
         safe_hero = safe_filename(hero_display)

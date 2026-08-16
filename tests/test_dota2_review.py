@@ -57,8 +57,8 @@ from dota2_review import (  # noqa: E402
 
 
 HEROES = {
-    "104": {"id": 104, "name": "npc_dota_hero_legion_commander", "localized_name": "Legion Commander"},
-    "8": {"id": 8, "name": "npc_dota_hero_juggernaut", "localized_name": "Juggernaut"},
+    "104": {"id": 104, "name": "npc_dota_hero_legion_commander", "localized_name": "Legion Commander", "roles": ["Initiator", "Durable", "Disabler"]},
+    "8": {"id": 8, "name": "npc_dota_hero_juggernaut", "localized_name": "Juggernaut", "roles": ["Carry", "Pusher", "Escape"]},
 }
 
 ITEMS = {
@@ -148,6 +148,9 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("主宰 · 英雄专项复盘", report)
         self.assertIn("职业比赛", report)
         self.assertIn("优先检查的差距", report)
+        self.assertIn("每局阵容与选人上下文", report)
+        self.assertIn("训练模式/自定义房机械练习", report)
+        self.assertIn("一张三局记录表", report)
 
     def setUp(self):
         radiant_gold = [600, 1000, 1600, 2200, 2800, 3400] + [3400] * 25
@@ -601,6 +604,27 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("## 我的表现", report)
         self.assertIn("👉 P0", report)
         self.assertIn("军团指挥官", report)
+        self.assertIn("## 双方阵容、选择顺序与选人分析输入", report)
+        self.assertIn("未提供可靠的 `picks_bans` 顺序", report)
+        self.assertIn("选人评分任务", report)
+
+    def test_report_uses_real_draft_order_and_visible_enemy_picks(self):
+        self.match["picks_bans"] = [
+            {"order": 0, "team": 0, "is_pick": False, "hero_id": 8},
+            {"order": 1, "team": 1, "is_pick": True, "hero_id": 8},
+            {"order": 2, "team": 0, "is_pick": True, "hero_id": 104},
+        ]
+        report, _ = generate_report(
+            self.match,
+            HEROES,
+            ITEMS,
+            focus_account_id=1000,
+            focus_player_slot=0,
+        )
+        self.assertIn("OpenDota 记录的选择/禁用顺序", report)
+        self.assertIn("全场第 2 个选择、己方第 1 个选择", report)
+        self.assertIn("此前已出现的敌人**：主宰", report)
+        self.assertIn("天辉功能标签", report)
 
     def test_report_adds_role_farming_and_teamfight_coaching_evidence(self):
         focus = self.match["players"][0]
@@ -667,6 +691,9 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("团战切入", AI_COACH_INSTRUCTIONS)
         self.assertIn("目标转化", AI_COACH_INSTRUCTIONS)
         self.assertIn("至少指出一项可复制的优点", AI_COACH_INSTRUCTIONS)
+        self.assertIn("1–10 分的“选人评分”", AI_COACH_INSTRUCTIONS)
+        self.assertIn("替代英雄", AI_COACH_INSTRUCTIONS)
+        self.assertIn("训练模式/自定义房机械练习", AI_COACH_INSTRUCTIONS)
 
     def test_chatgpt_bundle_contains_prompt_report_and_raw_json(self):
         report, _ = generate_report(self.match, HEROES, ITEMS)

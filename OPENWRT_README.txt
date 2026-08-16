@@ -1,4 +1,4 @@
-Dota 2 OpenDota MAX 复盘教练 v1.7.0（OpenWrt / iStoreOS 精简版）
+Dota 2 OpenDota MAX 复盘教练 v1.8.0（OpenWrt / iStoreOS 精简版）
 
 此压缩包不包含 Windows GUI、图片素材或打包运行时，适合软路由长期运行。
 
@@ -14,3 +14,5 @@ Dota 2 OpenDota MAX 复盘教练 v1.7.0（OpenWrt / iStoreOS 精简版）
 
 英雄专项命令示例：
 python3 dota2_review.py --hero-review 8 --history-count 5 --compare-source high_rank --benchmark-count 3
+
+v1.8.0 会在 OpenDota 提供数据时分析双方阵容和真实选人顺序，并要求 AI 输出选人评分、替代英雄取舍与可量化训练方法。软路由版仍不包含 GUI 和图片。
