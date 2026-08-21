@@ -39,6 +39,10 @@ from dota2_review import (  # noqa: E402
     resolve_steam_account_id,
     purge_generated_data,
     request_ai_review,
+    execute_daily_single_review,
+    resolve_patch_label,
+    validate_ai_review_contract,
+    version_calibration_lines,
     run_daily_review,
     save_account_id,
     save_ai_settings,
@@ -484,6 +488,17 @@ class ReviewTests(unittest.TestCase):
         request_mock.return_value = {
             "output": [
                 {
+                    "type": "web_search_call",
+                    "action": {
+                        "sources": [
+                            {
+                                "title": "Dota 2 官方更新",
+                                "url": "https://www.dota2.com/patches/7.41",
+                            }
+                        ]
+                    },
+                },
+                {
                     "type": "message",
                     "content": [{"type": "output_text", "text": "复盘完成"}],
                 }
@@ -503,6 +518,41 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(url, "https://api.openai.com/v1/responses")
         self.assertEqual(payload["input"], "比赛摘要")
         self.assertFalse(payload["store"])
+        self.assertEqual(payload["tools"][0]["type"], "web_search")
+        self.assertEqual(
+            payload["tools"][0]["filters"]["allowed_domains"],
+            ["dota2.com", "opendota.com"],
+        )
+        self.assertEqual(payload["include"], ["web_search_call.action.sources"])
+        self.assertEqual(payload["tool_choice"], "required")
+
+    @patch("dota2_review._request_ai_json")
+    def test_openai_review_rejects_missing_web_sources(self, request_mock):
+        request_mock.return_value = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "复盘正文"}],
+                }
+            ]
+        }
+        with self.assertRaises(AIReviewError):
+            request_ai_review(
+                {
+                    "provider": "openai",
+                    "api_key": "sk-test-secret-key",
+                    "model": "gpt-test",
+                    "reasoning_effort": "medium",
+                },
+                "比赛摘要",
+            )
+
+    @patch("dota2_review.run", return_value=0)
+    def test_frozen_daily_match_runs_in_process_without_gui_argparse(self, run_mock):
+        with patch("dota2_review.sys.frozen", True, create=True):
+            result = execute_daily_single_review(["123", "--no-ai-review"])
+        self.assertEqual(result, 0)
+        run_mock.assert_called_once_with(["123", "--no-ai-review"])
 
     @patch("dota2_review._request_ai_json")
     def test_deepseek_review_uses_chat_completions_shape(self, request_mock):
@@ -523,6 +573,32 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(url, "https://api.deepseek.com/chat/completions")
         self.assertEqual(payload["messages"][1]["content"], "比赛摘要")
         self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertNotIn("tools", payload)
+        self.assertIn("没有原生网页搜索工具", payload["messages"][0]["content"])
+
+    def test_ai_review_contract_requires_ten_sections_in_order(self):
+        text = "\n\n".join(
+            f"## {number}. {title}\n内容"
+            for number, title in enumerate(
+                (
+                    "一句话结论", "责任归因表", "证据摘要", "关键时间窗",
+                    "用户个人评价", "队友评价", "地图与团战建议", "下一阶段训练",
+                    "量化验收", "下次所需材料",
+                ),
+                start=1,
+            )
+        )
+        validate_ai_review_contract(text)
+        with self.assertRaises(AIReviewError):
+            validate_ai_review_contract(text.replace("## 6. 队友评价\n内容\n\n", ""))
+
+    def test_patch_calibration_uses_patch_field_not_parse_version(self):
+        patches = [{"id": 60, "name": "7.41"}]
+        match = {"patch": 60, "version": 999}
+        self.assertEqual(resolve_patch_label(patches, match["patch"]), "7.41")
+        lines = "\n".join(version_calibration_lines(match, patches))
+        self.assertIn("7.41", lines)
+        self.assertNotIn("999", lines)
 
     @patch("dota2_review._request_ai_json")
     def test_deepseek_max_never_downgrades_when_final_content_is_empty(
@@ -580,6 +656,7 @@ class ReviewTests(unittest.TestCase):
         report, missing = generate_report(self.match, HEROES, ITEMS)
         self.assertEqual(missing, [])
         for heading in (
+            "在线版本校准",
             "比赛概况",
             "天辉阵容与数据",
             "夜魇阵容与数据",

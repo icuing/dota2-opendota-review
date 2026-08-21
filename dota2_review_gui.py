@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -162,8 +163,34 @@ def scheduled_run_command() -> str:
     if getattr(sys, "frozen", False):
         return f'"{Path(sys.executable)}" --run-daily'
     pythonw = Path(sys.executable).with_name("pythonw.exe")
-    executable = pythonw if pythonw.exists() else Path(sys.executable)
-    return f'"{executable}" "{Path(__file__).resolve()}" --run-daily'
+    if not pythonw.exists():
+        located = shutil.which("pythonw.exe")
+        pythonw = Path(located) if located else pythonw
+    if not pythonw.exists():
+        raise OSError(
+            "源码版要静默定时运行必须安装 pythonw.exe；请使用官方 Python for Windows，"
+            "或改用已打包的 Windows EXE。"
+        )
+    return f'"{pythonw}" "{Path(__file__).resolve()}" --run-daily'
+
+
+def hidden_subprocess_kwargs() -> dict[str, int]:
+    return {"creationflags": int(getattr(subprocess, "CREATE_NO_WINDOW", 0))}
+
+
+def centered_dialog_geometry(
+    parent_x: int,
+    parent_y: int,
+    parent_width: int,
+    parent_height: int,
+    width: int,
+    height: int,
+    screen_width: int,
+    screen_height: int,
+) -> str:
+    x = max(0, min(parent_x + (parent_width - width) // 2, screen_width - width))
+    y = max(0, min(parent_y + (parent_height - height) // 2, screen_height - height))
+    return f"{width}x{height}+{x}+{y}"
 
 
 def configure_windows_schedule(app_dir: Path, run_time: str, *, enabled: bool) -> None:
@@ -189,22 +216,32 @@ def configure_windows_schedule(app_dir: Path, run_time: str, *, enabled: bool) -
             capture_output=True,
             text=True,
             check=False,
+            **hidden_subprocess_kwargs(),
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "创建任务失败").strip()
             raise OSError(detail)
+        subprocess.run(
+            ["schtasks.exe", "/Delete", "/F", "/TN", "Dota2 Daily Review"],
+            capture_output=True,
+            text=True,
+            check=False,
+            **hidden_subprocess_kwargs(),
+        )
         save_schedule_settings(settings_path, enabled=True, run_time=normalized)
         return
 
-    completed = subprocess.run(
-        ["schtasks.exe", "/Delete", "/F", "/TN", WINDOWS_TASK_NAME],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode not in (0, 1):
-        detail = (completed.stderr or completed.stdout or "删除任务失败").strip()
-        raise OSError(detail)
+    for task_name in (WINDOWS_TASK_NAME, "Dota2 Daily Review"):
+        completed = subprocess.run(
+            ["schtasks.exe", "/Delete", "/F", "/TN", task_name],
+            capture_output=True,
+            text=True,
+            check=False,
+            **hidden_subprocess_kwargs(),
+        )
+        if completed.returncode not in (0, 1):
+            detail = (completed.stderr or completed.stdout or "删除任务失败").strip()
+            raise OSError(detail)
     save_schedule_settings(settings_path, enabled=False, run_time=normalized)
 
 
@@ -1238,13 +1275,29 @@ class ReviewApp:
 
     def _dialog(self, title: str, width: int = 560, height: int = 430) -> tuple[Toplevel, tk.Frame]:
         dialog = Toplevel(self.root)
+        dialog.withdraw()
         dialog.title(title)
-        dialog.geometry(f"{width}x{height}")
         dialog.configure(bg=COLORS["bg"])
         dialog.transient(self.root)
         dialog.grab_set()
         body = tk.Frame(dialog, bg=COLORS["panel"], padx=24, pady=22)
         body.pack(fill=BOTH, expand=True, padx=18, pady=18)
+        self.root.update_idletasks()
+        dialog.geometry(
+            centered_dialog_geometry(
+                self.root.winfo_rootx(),
+                self.root.winfo_rooty(),
+                self.root.winfo_width(),
+                self.root.winfo_height(),
+                width,
+                height,
+                self.root.winfo_screenwidth(),
+                self.root.winfo_screenheight(),
+            )
+        )
+        dialog.deiconify()
+        dialog.lift()
+        dialog.focus_force()
         return dialog, body
 
     def _field(self, parent: tk.Widget, label: str, variable: StringVar, *, secret: bool = False) -> ttk.Entry:

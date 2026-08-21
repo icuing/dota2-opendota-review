@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$taskName = "Dota2 Daily Review"
+$taskName = "Dota2 Review Coach Daily"
 $defaultTime = "06:15"
 
 Write-Host "This installs a Windows daily task for Dota 2 reviews."
@@ -21,9 +21,13 @@ if (-not $valid) {
     throw "Invalid time. Use HH:mm, for example 06:15 or 23:30."
 }
 
-$runner = Join-Path $PSScriptRoot "run_daily_review.ps1"
-$argument = "-NoProfile -ExecutionPolicy Bypass -File `"$runner`""
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument
+$guiScript = Join-Path $PSScriptRoot "dota2_review_gui.py"
+$pythonw = Get-Command pythonw.exe -ErrorAction SilentlyContinue
+if (-not $pythonw) {
+    throw "pythonw.exe was not found. Install Python for Windows or use the packaged EXE scheduler."
+}
+$argument = "`"$guiScript`" --run-daily"
+$action = New-ScheduledTaskAction -Execute $pythonw.Source -Argument $argument -WorkingDirectory $PSScriptRoot
 $trigger = New-ScheduledTaskTrigger -Daily -At $parsedTime
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
@@ -48,3 +52,4 @@ Register-ScheduledTask `
 Write-Host "Installed task: $taskName"
 Write-Host "Daily time: $runTimeText"
 Write-Host "The task will run when possible after a missed start time."
+Unregister-ScheduledTask -TaskName "Dota2 Daily Review" -Confirm:$false -ErrorAction SilentlyContinue

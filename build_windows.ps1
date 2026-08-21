@@ -4,13 +4,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Version = & $PythonCommand -3 (Join-Path $ProjectDir "dota2_review.py") --version
+$PythonPrefix = @()
+if ((Split-Path -Leaf $PythonCommand) -in @("py", "py.exe")) {
+    $PythonPrefix = @("-3")
+}
+$Version = & $PythonCommand @PythonPrefix (Join-Path $ProjectDir "dota2_review.py") --version
 $ReleaseName = "Dota2ReviewCoach-v$Version"
 $DistDir = Join-Path $ProjectDir "dist"
 $BuildDir = Join-Path $ProjectDir "build"
 
-& $PythonCommand -3 -m pip install --upgrade pyinstaller
-& $PythonCommand -3 -m PyInstaller `
+& $PythonCommand @PythonPrefix -m pip install --upgrade pyinstaller
+& $PythonCommand @PythonPrefix -m PyInstaller `
     --noconfirm `
     --clean `
     --onefile `
@@ -21,6 +25,7 @@ $BuildDir = Join-Path $ProjectDir "build"
     --specpath $BuildDir `
     --add-data "$(Join-Path $ProjectDir 'dota_zh_names.json');." `
     --add-data "$(Join-Path $ProjectDir 'hero_names_zh.json');." `
+    --add-data "$(Join-Path $ProjectDir 'dota2_review_skill.md');." `
     --add-data "$(Join-Path $ProjectDir 'assets\dark-arena-background.png');assets" `
     --add-data "$(Join-Path $ProjectDir 'assets\drow-mascot-cutout.png');assets" `
     --add-data "$(Join-Path $ProjectDir 'assets\windranger-mascot-cutout.png');assets" `

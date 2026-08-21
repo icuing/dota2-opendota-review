@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dota2_review_gui import (  # noqa: E402
     build_hero_run_args,
     build_run_args,
+    centered_dialog_geometry,
     load_pc_settings,
     load_schedule_settings,
     masked_status,
@@ -107,6 +108,16 @@ class GuiTests(unittest.TestCase):
                 load_schedule_settings(path),
                 {"enabled": True, "time": "07:35"},
             )
+
+    def test_dialog_geometry_is_centered_and_clamped(self):
+        self.assertEqual(
+            centered_dialog_geometry(100, 50, 1200, 800, 600, 400, 1920, 1080),
+            "600x400+400+250",
+        )
+        self.assertEqual(
+            centered_dialog_geometry(-200, -100, 300, 200, 600, 400, 1920, 1080),
+            "600x400+0+0",
+        )
 
 
 if __name__ == "__main__":

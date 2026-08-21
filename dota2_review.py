@@ -29,9 +29,9 @@ except ImportError:  # OpenWrt's minimal Python build may omit this desktop-only
 
 API_BASE = "https://api.opendota.com/api"
 TELEGRAM_API_BASE = "https://api.telegram.org"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 USER_AGENT = f"dota2-match-review/{APP_VERSION}"
-CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+CACHE_MAX_AGE_SECONDS = 12 * 60 * 60
 STEAM_ID64_BASE = 76561197960265728
 MAX_ACCOUNT_ID = 2**32 - 1
 PARSE_POLL_INTERVAL_SECONDS = 10 * 60
@@ -46,6 +46,20 @@ AI_PROVIDER_DEFAULTS = {
     "openai": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
     "deepseek": {"model": "deepseek-v4-pro", "reasoning_effort": "max"},
 }
+AI_REVIEW_MODES = {"single", "daily", "hero"}
+AI_REQUIRED_SECTIONS = (
+    "一句话结论",
+    "责任归因表",
+    "证据摘要",
+    "关键时间窗",
+    "用户个人评价",
+    "队友评价",
+    "地图与团战建议",
+    "下一阶段训练",
+    "量化验收",
+    "下次所需材料",
+)
+OFFICIAL_WEB_DOMAINS = ["dota2.com", "opendota.com"]
 AI_COACH_INSTRUCTIONS = """你是一名专业、严格但不羞辱玩家的 Dota 2 中文教练。你的目标不是复述 KDA 或只追究死亡，而是帮助玩家建立可重复的对线、发育、出装、地图、团战切入和技能释放决策。主要依据输入中的 OpenDota 数据和“教练证据包”分析，不得声称看过录像，也不得把推测写成事实。
 
 写作与分析要求：
@@ -78,6 +92,32 @@ AI_COACH_INSTRUCTIONS = """你是一名专业、严格但不羞辱玩家的 Dota
 12. 对同英雄多局专项复盘，额外给出“可直接照做的训练计划”：至少包含一项训练模式/自定义房机械练习、一项连续三局的对线或发育练习、一项团战切入/技能释放练习。每项必须写清准备方式、重复次数或时长、成功标准、失败后如何降低难度；目标应来自输入样本，不得给“多看录像、多练习”一类空话。
 
 建议正文结构：一句话总评、英雄与职责、阵容与选人评分、可复制的优点、最影响胜率的 2–4 个问题、分阶段复盘、关键团战与死亡、出装方案、实操训练计划。引用具体时间、经济差、装备和技能作为证据。事实与推测在相关段落内就地标注，不要单独写一大段泛泛的免责声明。"""
+
+AI_OUTPUT_CONTRACT = """
+你必须严格按以下十个二级标题、相同顺序输出，不能增删或改名：
+## 1. 一句话结论
+## 2. 责任归因表
+## 3. 证据摘要
+## 4. 关键时间窗
+## 5. 用户个人评价
+## 6. 队友评价
+## 7. 地图与团战建议
+## 8. 下一阶段训练
+## 9. 量化验收
+## 10. 下次所需材料
+
+每个关键判断必须就地标注证据类型：[数据事实]、[画面推断]、[用户陈述] 或 [教练假设]。
+没有录像或截图时，[画面推断]必须写“无画面证据”，禁止声称看过录像、看见视野、知道精确施法顺序或确定最后一击技能。
+补丁、技能机制、装备数值和版本环境属于版本敏感结论：只有联网检索到 Dota 2 官方资料，或输入提供明确版本校准证据时才能确定陈述，并附来源链接；否则必须写“版本待校准”，只给不依赖具体数值的原则。
+严禁用常识、印象或模型记忆填补缺失字段；无法由证据确认时明确写“不知道/无法判断/需要录像确认”。
+"""
+
+AI_MODE_INSTRUCTIONS = {
+    "single": "这是单场自动复盘。围绕这场比赛的证据链输出十段报告。",
+    "daily": "这是每日代表局自动复盘。分别引用每场 Match ID，比较可复制优点、最早失控点与下一局优先动作。",
+    "hero": "这是同英雄多局专项复盘。必须沿用单场自动复盘的证据维度，按 Match ID 分区比较，不得把不同比赛事件串局；聚合训练结论至少由多局同类证据支持，否则标为候选训练主题。",
+}
+
 
 GAME_MODES = {
     1: "All Pick",
@@ -216,6 +256,38 @@ def load_constant(resource: str, cache_dir: Path) -> Any:
         # A read-only folder should not prevent report generation.
         pass
     return data
+
+
+def resolve_patch_label(patches: Any, patch_id: Any) -> str | None:
+    """Map a match patch id to OpenDota's online patch label without guessing."""
+    if patch_id is None:
+        return None
+    rows = patches.values() if isinstance(patches, dict) else patches
+    if not isinstance(rows, Iterable) or isinstance(rows, (str, bytes)):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("id")) == str(patch_id):
+            label = str(row.get("name") or "").strip()
+            return label or None
+    return None
+
+
+def version_calibration_lines(match: dict[str, Any], patches: Any) -> list[str]:
+    patch_id = match.get("patch")
+    label = resolve_patch_label(patches, patch_id)
+    if label:
+        official_url = f"https://www.dota2.com/patches/{label}?l=schinese"
+        return [
+            f"- 对局版本：[数据事实] OpenDota patch ID `{patch_id}` → `{label}`。",
+            f"- 官方校准入口：[{label} 官方更新页]({official_url})；AI 必须核对该页后才能断言版本机制或具体数值。",
+            "- 英雄、装备与技能事实：比赛字段来自 OpenDota 在线接口；本地中文表只负责翻译名称，不证明版本机制。",
+        ]
+    return [
+        f"- 对局版本：[数据事实] OpenDota patch ID `{patch_id}`，但未能映射到明确补丁名称。",
+        "- 校准状态：版本待校准；禁止断言当前/历史版本的技能、装备数值与改动。",
+    ]
 
 
 def load_zh_names(script_dir: Path) -> dict[str, dict[str, str]]:
@@ -418,11 +490,98 @@ def print_ai_usage(response: Any, provider: str) -> None:
         print(f"AI 用量（{provider}）：" + "，".join(parts) + "。")
 
 
+def load_review_skill_prompt() -> str:
+    """Load the bundled coaching skill used by every production AI review."""
+    path = resource_dir() / "dota2_review_skill.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        text = ""
+    return text or "按证据复盘；资料不足时明确无法判断，禁止编造。"
+
+
+def build_ai_instructions(review_mode: str) -> str:
+    if review_mode not in AI_REVIEW_MODES:
+        raise ValueError(f"未知 AI 复盘模式：{review_mode}")
+    return "\n\n".join(
+        (
+            AI_COACH_INSTRUCTIONS,
+            "# 已配置的 Dota 2 复盘技能\n" + load_review_skill_prompt(),
+            "# 本次模式\n" + AI_MODE_INSTRUCTIONS[review_mode],
+            "# 强制输出合同\n" + AI_OUTPUT_CONTRACT,
+        )
+    )
+
+
+def validate_ai_review_contract(text: str) -> None:
+    """Reject incomplete AI prose so it is never presented as a final review."""
+    cursor = -1
+    missing: list[str] = []
+    for number, title in enumerate(AI_REQUIRED_SECTIONS, start=1):
+        match = re.search(
+            rf"(?m)^##\s*{number}[.、．]?\s*{re.escape(title)}\s*$",
+            text,
+        )
+        if match is None or match.start() <= cursor:
+            missing.append(f"{number}. {title}")
+        else:
+            cursor = match.start()
+    if missing:
+        raise AIReviewError(
+            "AI 返回内容未通过十段复盘合同校验（缺少或乱序："
+            + "、".join(missing)
+            + "）；为避免残缺或自由发挥，本次不保存为最终复盘。"
+        )
+
+
+def extract_openai_web_sources(response: Any) -> list[tuple[str, str]]:
+    """Return allowlisted web-search sources included by the Responses API."""
+    found: list[tuple[str, str]] = []
+    for item in response.get("output", []) if isinstance(response, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        candidates: list[Any] = []
+        action = item.get("action")
+        if isinstance(action, dict):
+            candidates.extend(action.get("sources") or [])
+        for content in item.get("content", []) if isinstance(item.get("content"), list) else []:
+            if not isinstance(content, dict):
+                continue
+            candidates.extend(content.get("annotations") or [])
+        for source in candidates:
+            if not isinstance(source, dict):
+                continue
+            url = str(source.get("url") or "").strip()
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or not url or not any(
+                host == domain or host.endswith("." + domain)
+                for domain in OFFICIAL_WEB_DOMAINS
+            ):
+                continue
+            title = str(source.get("title") or host).strip() or host
+            title = title.replace("[", "（").replace("]", "）")
+            pair = (title, url)
+            if pair not in found:
+                found.append(pair)
+    return found
+
+
+def insert_web_sources(text: str, sources: list[tuple[str, str]]) -> str:
+    marker = re.search(r"(?m)^##\s*4[.、．]?\s*关键时间窗\s*$", text)
+    if marker is None:
+        return text
+    source_lines = ["", "联网校准来源（OpenAI Responses web_search）："]
+    source_lines.extend(f"- [{title}]({url})" for title, url in sources)
+    return text[: marker.start()] + "\n".join(source_lines) + "\n\n" + text[marker.start() :]
+
+
 def request_ai_review(
     config: dict[str, Any],
     source_text: str,
     *,
     test_mode: bool = False,
+    review_mode: str | None = None,
 ) -> str:
     clean = validate_ai_settings(config)
     max_tokens = 512 if test_mode else 8000
@@ -433,10 +592,26 @@ def request_ai_review(
             "reasoning": {"effort": clean["reasoning_effort"]},
             "max_output_tokens": max_tokens,
             "instructions": (
-                "只回复：API连接成功" if test_mode else AI_COACH_INSTRUCTIONS
+                "只回复：API连接成功"
+                if test_mode
+                else build_ai_instructions(review_mode or "single")
             ),
             "input": source_text,
         }
+        if not test_mode:
+            payload.update(
+                {
+                    "tools": [
+                        {
+                            "type": "web_search",
+                            "filters": {"allowed_domains": OFFICIAL_WEB_DOMAINS},
+                        }
+                    ],
+                    "tool_choice": "required",
+                    "include": ["web_search_call.action.sources"],
+                    "max_tool_calls": 3,
+                }
+            )
         response = _request_ai_json(OPENAI_API_URL, payload, clean["api_key"])
         if not test_mode:
             print_ai_usage(response, "OpenAI")
@@ -448,11 +623,25 @@ def request_ai_review(
                 if isinstance(content, dict) and content.get("type") == "output_text":
                     texts.append(str(content.get("text") or ""))
         result = "\n".join(text for text in texts if text).strip()
+        if not test_mode:
+            web_sources = extract_openai_web_sources(response)
+            if not web_sources:
+                raise AIReviewError(
+                    "OpenAI 未返回可验证的官方网页搜索来源；为避免把模型记忆当成最新版本事实，"
+                    "本次不保存为最终复盘。"
+                )
+            result = insert_web_sources(result, web_sources)
     else:
         messages = [
             {
                 "role": "system",
-                "content": "只回复：API连接成功" if test_mode else AI_COACH_INSTRUCTIONS,
+                "content": (
+                    "只回复：API连接成功"
+                    if test_mode
+                    else build_ai_instructions(review_mode or "single")
+                    + "\n\nDeepSeek 标准 API 在本程序中没有原生网页搜索工具。"
+                    "只能使用输入里的在线 OpenDota 版本锚点；若不足，必须写版本待校准，严禁假装已联网。"
+                ),
             },
             {"role": "user", "content": source_text},
         ]
@@ -481,6 +670,8 @@ def request_ai_review(
             "AI 接口没有返回最终正文；为保证质量，本次没有降级到非思考模式。"
             "请稍后重试。"
         )
+    if not test_mode and review_mode is not None:
+        validate_ai_review_contract(result)
     return result
 
 
@@ -2164,8 +2355,6 @@ HERO_ROLE_LABELS = {
     "Pusher": "推进",
     "Initiator": "先手",
 }
-
-
 def make_hero_roles_map(heroes: Any) -> dict[int, list[str]]:
     result: dict[int, list[str]] = {}
     values: Iterable[Any] = heroes.values() if isinstance(heroes, dict) else heroes or []
@@ -2369,6 +2558,7 @@ def generate_report(
     heroes: Any,
     items: Any,
     *,
+    patches: Any = None,
     zh_names: dict[str, dict[str, str]] | None = None,
     include_all_purchases: bool = False,
     focus_account_id: int | None = None,
@@ -2400,6 +2590,8 @@ def generate_report(
         f"> 数据来源：[OpenDota 比赛页面](https://www.opendota.com/matches/{match_id})；生成时间：{generated_at}",
         "",
     ]
+    lines += ["## 在线版本校准", ""]
+    lines += version_calibration_lines(match, patches) + [""]
     if missing:
         lines += [
             "> [!WARNING]",
@@ -2847,6 +3039,45 @@ def _metric_cell(metrics: dict[str, float], key: str, *, integer: bool = False) 
     return f"{value:.0f}" if integer else f"{value:.1f}"
 
 
+def compact_automatic_review_evidence(
+    sample: dict[str, Any],
+    heroes: Any,
+    items: Any,
+    patches: Any,
+    zh_names: dict[str, dict[str, str]],
+) -> str:
+    """Reuse automatic-review evidence categories without sending raw full JSON."""
+    match = sample["match"]
+    player = sample["player"]
+    full, _missing = generate_report(
+        match,
+        heroes,
+        items,
+        patches=patches,
+        zh_names=zh_names,
+        focus_player_slot=int(player.get("player_slot") or 0),
+    )
+    wanted = {
+        "在线版本校准",
+        "比赛概况",
+        "我的表现",
+        "双方阵容、选择顺序与选人分析输入",
+        "出装与购买时间",
+        "我的技能与伤害证据",
+        "英雄定位与胜利责任证据（Max）",
+        "团战切入与技能释放证据（Max）",
+        "关键死亡教练证据（Max）",
+    }
+    selected: list[str] = []
+    keep = False
+    for line in full.splitlines():
+        if line.startswith("## "):
+            keep = line[3:].strip() in wanted
+        if keep:
+            selected.append(line)
+    return "\n".join(selected).strip()
+
+
 def build_hero_training_report(
     hero_id: int,
     hero_display_name: str,
@@ -2854,6 +3085,11 @@ def build_hero_training_report(
     benchmark_samples: list[dict[str, Any]],
     comparison_source: str,
     hero_by_id: dict[int, str] | None = None,
+    *,
+    heroes: Any = None,
+    items: Any = None,
+    patches: Any = None,
+    zh_names: dict[str, dict[str, str]] | None = None,
 ) -> str:
     hero_by_id = hero_by_id or load_chinese_hero_names()
     own = hero_sample_metrics(personal_samples)
@@ -2903,6 +3139,20 @@ def build_hero_training_report(
             f"{int(numeric_value(player.get('assists')))}｜GPM {int(numeric_value(player.get('gold_per_min')))}｜"
             f"补刀 {int(numeric_value(player.get('last_hits')))}"
         )
+        if heroes is not None and items is not None:
+            lines += [
+                "",
+                f"### 个人 {index} · 自动复盘证据卡",
+                "",
+                compact_automatic_review_evidence(
+                    sample,
+                    heroes,
+                    items,
+                    patches,
+                    zh_names or {"items": {}, "abilities": {}},
+                ),
+                "",
+            ]
     lines += ["", "## 每局阵容与选人上下文", ""]
     for index, sample in enumerate(personal_samples, start=1):
         lines.append(f"### 个人 {index} · Match `{sample['match'].get('match_id')}`")
@@ -2920,6 +3170,20 @@ def build_hero_training_report(
                 f"补刀 {int(numeric_value(player.get('last_hits')))}"
             )
             lines.extend(compact_draft_context(match, player, hero_by_id))
+            if heroes is not None and items is not None:
+                lines += [
+                    "",
+                    f"### 对比 {index} · 自动复盘证据卡",
+                    "",
+                    compact_automatic_review_evidence(
+                        sample,
+                        heroes,
+                        items,
+                        patches,
+                        zh_names or {"items": {}, "abilities": {}},
+                    ),
+                ]
+            lines.append("")
         gaps = [
             ("GPM", own.get("gold_per_min", 0) - benchmark.get("gold_per_min", 0), "经济效率"),
             ("XPM", own.get("xp_per_min", 0) - benchmark.get("xp_per_min", 0), "经验效率"),
@@ -2935,7 +3199,7 @@ def build_hero_training_report(
         "",
         "## 给 AI 教练的任务",
         "",
-        "请结合每局原始数据判断趋势，不要只比较平均 KDA。重点分析英雄职责、打钱路线、关键装备时机、团战切入、技能释放、死亡原因和赢团后的地图目标。对职业/高分样本的差异要考虑比赛节奏与位置差异，不能机械照抄。",
+        "请严格沿用上方每局自动复盘证据卡，不要自由补写数据，不要只比较平均 KDA。重点分析英雄职责、打钱路线、关键装备时机、团战切入、技能释放、死亡原因和赢团后的地图目标。对职业/高分样本的差异要考虑比赛节奏与位置差异，不能机械照抄。",
         "",
         "必须逐局分析双方阵容，并给用户这次选择该英雄 1–10 分的选人评分。评分拆解为对线适配、己方功能补位、敌方威胁和选择时机；不得用最终输赢/KDA倒推。选择顺序缺失时明确标注且不扣分。只有确有更好选择时才推荐 1–3 个中文英雄名，并说明收益、针对目标和代价。",
         "",
@@ -2943,6 +3207,14 @@ def build_hero_training_report(
         "",
     ]
     return "\n".join(lines)
+
+
+def execute_daily_single_review(single_args: list[str]) -> int:
+    """Run a representative match in-process for frozen EXEs, subprocess otherwise."""
+    if getattr(sys, "frozen", False):
+        return run(single_args)
+    command = [sys.executable, str(Path(__file__).resolve()), *single_args]
+    return subprocess.run(command, check=False).returncode
 
 
 def run_hero_training(
@@ -2964,6 +3236,13 @@ def run_hero_training(
         output_root = Path.cwd() / output_root
     try:
         heroes = load_constant("heroes", script_dir / ".cache")
+        items = load_constant("items", script_dir / ".cache")
+        try:
+            patches = load_constant("patch", script_dir / ".cache")
+        except OpenDotaError as exc:
+            print(f"在线补丁映射暂不可用，将按版本待校准处理：{exc}", file=sys.stderr)
+            patches = None
+        zh_names = load_zh_names(script_dir)
         hero_by_id, _ = make_hero_maps(heroes)
         hero_display = hero_name(hero_id, hero_by_id)
         print(f"正在读取你使用 {hero_display} 的最近 {own_count} 局比赛 …")
@@ -2990,6 +3269,10 @@ def run_hero_training(
             benchmark_samples,
             comparison_source,
             hero_by_id,
+            heroes=heroes,
+            items=items,
+            patches=patches,
+            zh_names=zh_names,
         )
         timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M")
         safe_hero = safe_filename(hero_display)
@@ -3013,7 +3296,7 @@ def run_hero_training(
                 print("尚未配置 AI，本次已生成基础专项报告。")
             else:
                 print("正在进行一次 AI 英雄专项对比复盘 …")
-                ai_text = request_ai_review(ai_config, report)
+                ai_text = request_ai_review(ai_config, report, review_mode="hero")
                 ai_path = study_dir / f"{safe_hero}_AI专项教练复盘.md"
                 ai_path.write_text(ai_text, encoding="utf-8-sig", newline="\n")
                 print(f"AI 专项复盘已生成：{ai_path}")
@@ -3121,11 +3404,10 @@ def run_daily_review(
         except ValueError:
             print(f"跳过无效比赛记录：{match.get('match_id')}", file=sys.stderr)
             continue
-        command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
+        single_args = [
             str(match_id),
             "--no-open-project",
+            "--no-ai-review",
             "--parse-timeout",
             str(args.parse_timeout),
             "--output-root",
@@ -3133,11 +3415,11 @@ def run_daily_review(
             "--require-complete",
         ]
         if not args.request_parse:
-            command.append("--no-request-parse")
+            single_args.append("--no-request-parse")
         if args.all_purchases:
-            command.append("--all-purchases")
+            single_args.append("--all-purchases")
         print(f"\n正在处理{label}的一局：{match_id}")
-        result = subprocess.run(command, check=False)
+        return_code = execute_daily_single_review(single_args)
         artifact_stem = build_match_artifact_stem(
             match,
             heroes,
@@ -3146,10 +3428,10 @@ def run_daily_review(
         )
         match_dir = output_dir / artifact_stem
         bundle_path = match_dir / f"{artifact_stem}_GPT复盘包.md"
-        if result.returncode == 0 and bundle_path.exists():
+        if return_code == 0 and bundle_path.exists():
             completed.append((label, match, bundle_path))
         else:
-            print(f"比赛 {match_id} 处理失败，退出代码 {result.returncode}。", file=sys.stderr)
+            print(f"比赛 {match_id} 处理失败，退出代码 {return_code}。", file=sys.stderr)
 
     if len(completed) != len(selected):
         print(
@@ -3241,7 +3523,9 @@ def run_daily_review(
         provider = ai_provider_name(ai_config)
         print(f"正在调用 {provider} / {ai_config['model']} 生成最终教练复盘 …")
         try:
-            ai_review = request_ai_review(ai_config, "\n".join(ai_input_lines))
+            ai_review = request_ai_review(
+                ai_config, "\n".join(ai_input_lines), review_mode="daily"
+            )
             ai_review_path = output_dir / f"daily_{target_date.isoformat()}_AI最终复盘.md"
             ai_review_path.write_text(
                 f"# {target_date.isoformat()} · AI 最终教练复盘\n\n"
@@ -3919,6 +4203,11 @@ def run(argv: list[str] | None = None) -> int:
         print("正在读取英雄与物品名称 …")
         heroes = load_constant("heroes", cache_dir)
         items = load_constant("items", cache_dir)
+        try:
+            patches = load_constant("patch", cache_dir)
+        except OpenDotaError as exc:
+            print(f"在线补丁映射暂不可用，将按版本待校准处理：{exc}", file=sys.stderr)
+            patches = None
         zh_names = load_zh_names(script_dir)
         artifact_stem = build_match_artifact_stem(
             match,
@@ -3938,6 +4227,7 @@ def run(argv: list[str] | None = None) -> int:
             match,
             heroes,
             items,
+            patches=patches,
             zh_names=zh_names,
             include_all_purchases=args.all_purchases,
             focus_account_id=focus_account_id,
@@ -3977,7 +4267,7 @@ def run(argv: list[str] | None = None) -> int:
             provider = ai_provider_name(ai_config)
             print(f"正在调用 {provider} / {ai_config['model']} 生成最终教练复盘 …")
             try:
-                ai_review = request_ai_review(ai_config, report)
+                ai_review = request_ai_review(ai_config, report, review_mode="single")
                 ai_review_path = artifact_dir / f"{artifact_stem}_AI最终复盘.md"
                 ai_review_path.write_text(
                     f"# Match {match_id} · AI 最终教练复盘\n\n"

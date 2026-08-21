@@ -6,19 +6,19 @@
 
 ![连接与设置](docs/screenshots/windows-settings.png)
 
-## v1.8.0 重点更新
+## v1.9.0 重点更新
 
-- 同英雄专项复盘新增可直接照做的训练计划：训练房机械练习、连续三局对线/发育练习、团战切入/技能练习与量化通过标准。
-- 所有复盘都会分析双方最终阵容、开团/控制/前排/推进等功能覆盖，以及用户英雄在阵容中的职责。
-- OpenDota 提供真实 BP 数据时，报告会还原选择/禁用顺序，并列出用户选人前已经出现的队友与敌人；数据缺失时明确不推测。
-- AI 必须给本局选人 1–10 分，分别评价对线适配、阵容补位、敌方威胁和选择时机；确有更优选择时才推荐 1–3 个替代英雄并解释取舍。
+- 所有 AI 复盘统一加载仓库中的 `dota2_review_skill.md`，严格执行证据分级、责任归因、十段固定报告和量化训练规则。
+- OpenAI 路线通过 Responses API 的官方 `web_search` 工具核对 Dota 2/OpenDota 权威网页；DeepSeek 不伪装原生联网，只使用程序提供的在线版本锚点，证据不足时明确“版本待校准”。
+- 同英雄 3/5/10 局专项复盘复用单场自动复盘的阵容、职责、出装、技能、团战与关键死亡证据卡，不再仅凭均值自由发挥。
+- Windows 定时任务改为 `--windowed` EXE 或 `pythonw.exe` 静默运行，日志留在本地；设置弹窗始终相对主界面居中并限制在屏幕范围内。
 
 以往版本的功能变化完整保留在 [`CHANGELOG.md`](CHANGELOG.md)，本节只展示当前版本新增内容。
 
 ## Windows：小白直接使用
 
-1. 下载仓库 `dist` 目录中的 [`dota2-opendota-review-v1.8.0-windows.zip`](dist/dota2-opendota-review-v1.8.0-windows.zip)。
-2. 解压后把 `Dota2ReviewCoach-v1.8.0.exe` 放入一个长期使用的文件夹。
+1. 下载仓库 `dist` 目录中的 [`dota2-opendota-review-v1.9.0-windows.zip`](dist/dota2-opendota-review-v1.9.0-windows.zip)。
+2. 解压后把 `Dota2ReviewCoach-v1.9.0.exe` 放入一个长期使用的文件夹。
 3. 双击运行，进入“连接设置”。
 4. 依次设置 Dota 好友代码或 SteamID64、OpenAI/DeepSeek API、Server酱 SendKey，以及可选的 Telegram 备用渠道。
 5. 回到“战局复盘”：输入 Match ID 生成单场复盘，或点击“运行每日复盘”。启用状态会显示清晰的绿色 `✔`。
@@ -62,7 +62,7 @@ py dota2_review.py --daily --day-offset 1
 4. 点击“保存并启用”；状态栏显示 `✔ 已启用：每天 06:15` 即完成。
 5. 以后修改时间只需重新进入并保存，不会重复创建任务；点击“停用定时任务”即可关闭。
 
-定时任务会调用同一个 EXE 的后台每日模式，沿用已保存的 Steam、AI、微信和 Telegram 设置；日志写入 EXE 旁的 `daily_logs/windows-scheduled.log`。电脑在计划时间需要开机，EXE 不能被移动或改名。
+定时任务会调用同一个无控制台 EXE 的后台每日模式，沿用已保存的 Steam、AI、微信和 Telegram 设置；日志写入 EXE 旁的 `daily_logs/windows-scheduled.log`，不会弹出命令提示窗口。源码运行必须使用随官方 Python for Windows 安装的 `pythonw.exe`；程序不会回退到会弹窗的 `python.exe`。升级后重新保存一次定时时间会迁移到统一任务名 `Dota2 Review Coach Daily`。
 
 ## AI 教练如何分析
 
@@ -74,7 +74,7 @@ python3 dota2_review.py --show-ai
 python3 dota2_review.py --test-ai
 ```
 
-AI 提示词强制区分“事实、合理推断、需要录像确认”，并要求：
+AI 提示词会加载 [`dota2_review_skill.md`](dota2_review_skill.md)，强制区分“数据事实、画面推断、用户陈述、教练假设”，并要求：
 
 - 先给出一至五号位倾向、证据和置信度；
 - 同时指出可复制的优点与拖累胜率的问题；
@@ -82,6 +82,10 @@ AI 提示词强制区分“事实、合理推断、需要录像确认”，并�
 - 按对线、强势期、刷钱路线、团战、控图/肉山/推塔转化还原因果链；
 - 结合双方阵容和真实 BP 顺序评价选人，给出不受最终胜负影响的 1–10 分；
 - 最后给出三条“触发信号 → 当场动作 → 赛后指标”的训练任务。
+
+最终 AI 报告必须按“一句话结论 → 责任归因表 → 证据摘要 → 关键时间窗 → 用户个人评价 → 队友评价 → 地图与团战建议 → 下一阶段训练 → 量化验收 → 下次所需材料”十段输出。缺段或乱序会被本地校验拒绝，不会保存或推送为最终复盘。
+
+OpenAI 使用官方 Responses API 联网搜索，并把搜索域限制为 `dota2.com` 和 `opendota.com`。DeepSeek 标准 API 在本项目中没有可验证的原生网页搜索工具，因此程序会把 OpenDota 的对局 `patch` 字段映射为补丁名称和 Dota 2 官方补丁入口；映射失败或资料不足时，AI 必须停止版本数值/机制推断。联网搜索可能产生额外 API 费用。
 
 OpenDota 没有录像画面。程序不会假装看过 Replay；走位细节、视野边缘和具体最后一击技能无法由数据证明时，报告会提示需要结合录像确认。
 
@@ -119,7 +123,7 @@ python3 dota2_review.py 8943397976 --send --parse-timeout 60 --no-open-project
 
 ## iStoreOS / OpenWrt 完整更新与安装
 
-下载 [`dota2-opendota-review-v1.8.0-openwrt.zip`](dist/dota2-opendota-review-v1.8.0-openwrt.zip)。这是不含 GUI、图片与 Windows 运行时的精简包。
+下载 [`dota2-opendota-review-v1.9.0-openwrt.zip`](dist/dota2-opendota-review-v1.9.0-openwrt.zip)。这是不含 GUI、图片与 Windows 运行时的精简包。
 
 建议放在持久化磁盘，例如 `/mnt/data_sda3/dota2-review`，不要放进固件临时目录。
 
@@ -132,7 +136,7 @@ mkdir -p /mnt/data_sda3/dota2-review
 cd /mnt/data_sda3/dota2-review
 ```
 
-把仓库中的 `dota2_review.py`、`dota_zh_names.json`、`hero_names_zh.json`、`run_daily_review.sh`、`install_openwrt_cron.sh` 和 `uninstall_openwrt_cron.sh` 上传到该目录。
+把仓库中的 `dota2_review.py`、`dota2_review_skill.md`、`dota_zh_names.json`、`hero_names_zh.json`、`run_daily_review.sh`、`install_openwrt_cron.sh` 和 `uninstall_openwrt_cron.sh` 上传到该目录。
 
 ### 2. 配置账号、AI 与推送
 
