@@ -1347,11 +1347,27 @@ def fetch_player_hero_matches(
 
 
 def fetch_pro_hero_matches(hero_id: int, limit: int) -> list[dict[str, Any]]:
-    """Return recent professional matches in which the hero was played."""
+    """Return recent *winning* professional matches in which the hero was played.
+
+    OpenDota's hero-match endpoint is the professional sample used by this
+    project.  A row is retained only when the hero's player-side result is a
+    win; rows without enough side/result evidence are excluded rather than
+    guessed.
+    """
     response = request_json(f"/heroes/{int(hero_id)}/matches")
     if not isinstance(response, list):
         raise OpenDotaError("OpenDota 返回的职业比赛列表格式异常。")
-    return [row for row in response if isinstance(row, dict)][:limit]
+    selected: list[dict[str, Any]] = []
+    for row in response:
+        if not isinstance(row, dict):
+            continue
+        if "player_slot" not in row or "radiant_win" not in row:
+            continue
+        if player_match_won(row):
+            selected.append(row)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def public_match_contains_hero(match: dict[str, Any], hero_id: int) -> bool:
@@ -1364,6 +1380,26 @@ def public_match_contains_hero(match: dict[str, Any], hero_id: int) -> bool:
             except (TypeError, ValueError):
                 continue
     return False
+
+
+def public_match_hero_won(match: dict[str, Any], hero_id: int) -> bool:
+    """Return true only when the selected hero is on the winning public side."""
+    radiant_team = match.get("radiant_team")
+    dire_team = match.get("dire_team")
+    try:
+        hero = int(hero_id)
+    except (TypeError, ValueError):
+        return False
+    try:
+        radiant = isinstance(radiant_team, list) and hero in {int(v) for v in radiant_team}
+        dire = isinstance(dire_team, list) and hero in {int(v) for v in dire_team}
+    except (TypeError, ValueError):
+        return False
+    if radiant == dire:  # absent or duplicated data is not safe evidence
+        return False
+    if not isinstance(match.get("radiant_win"), bool):
+        return False
+    return radiant == bool(match["radiant_win"])
 
 
 def fetch_high_rank_hero_matches(
@@ -1380,7 +1416,12 @@ def fetch_high_rank_hero_matches(
         if not isinstance(response, list):
             raise OpenDotaError("OpenDota 返回的高分路人比赛列表格式异常。")
         rows = [row for row in response if isinstance(row, dict)]
-        selected.extend(row for row in rows if public_match_contains_hero(row, hero_id))
+        selected.extend(
+            row
+            for row in rows
+            if public_match_contains_hero(row, hero_id)
+            and public_match_hero_won(row, hero_id)
+        )
         if len(selected) >= limit or not rows:
             break
         ids = [int(row["match_id"]) for row in rows if str(row.get("match_id", "")).isdigit()]
